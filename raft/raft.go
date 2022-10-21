@@ -223,7 +223,7 @@ func newRaft(c *Config) *Raft {
 		raft.Vote = hardState.Vote
 		raft.RaftLog.committed = hardState.Commit
 	}
-	raft.RaftLog.appliedTo(c.Applied)
+	raft.RaftLog.applyTo(c.Applied)
 	raft.resetRandomizedElectionTimeout()
 	return raft
 }
@@ -249,11 +249,44 @@ func (r *Raft) sendRequestVote(to uint64) {
 	r.msgs = append(r.msgs, message)
 }
 
+func (r *Raft) broadcastAppend() {
+	for to := range r.Prs {
+		if to == r.id {
+			continue
+		}
+		r.sendAppend(to)
+	}
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	pr := r.Prs[to]
+	li := r.RaftLog.LastIndex()
+	var prevLogIndex uint64
+	if pr.Next-1 > li {
+		prevLogIndex = li
+	} else {
+		prevLogIndex = pr.Next - 1
+	}
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	entries := r.RaftLog.Entries(prevLogIndex+1, r.RaftLog.LastIndex()+1)
+	message := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: prevLogTerm,
+		Index:   prevLogIndex,
+		Entries: entries,
+		Commit:  r.RaftLog.committed,
+	}
+	r.msgs = append(r.msgs, message)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -336,7 +369,11 @@ func (r *Raft) becomeLeader() {
 		r.Prs[i].Next = r.RaftLog.LastIndex() + 1
 	}
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
-	// TODO(bigboss) 插入一条空日志
+	r.RaftLog.append(&pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term})
+	// 为什么要更新自己的 progress ？不更新过不了测试
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+	r.broadcastAppend()
 }
 
 func (r *Raft) singleNodeCandidate() bool {
@@ -421,6 +458,20 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	if r.RaftLog.matchTerm(m.Index, m.LogTerm) {
+		li := r.RaftLog.LastIndex()
+		for i := range m.Entries {
+			m.Entries[i].Index = li + 1 + uint64(i)
+			m.Entries[i].Term = r.Term
+		}
+		li = r.RaftLog.append(m.Entries...)
+		r.Prs[r.id].Match = r.RaftLog.LastIndex()
+		r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+		DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
+	} else {
+		// TODO(bigboss) 当日志和 leader 有冲突时用 leader 的日志覆盖
+	}
+
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -446,12 +497,29 @@ func (r *Raft) removeNode(id uint64) {
 func tickLeader(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
+		DPrintf("%v receive beat message: %v", r.id, m)
 		for to := range r.Prs {
 			if to == r.id {
 				continue
 			}
 			r.sendHeartbeat(to)
 		}
+	case pb.MessageType_MsgPropose:
+		DPrintf("%v receive propose message: %v", r.id, m)
+		if len(m.Entries) == 0 {
+			log.Panicf("%v can't append nil entries", r.id)
+		}
+		li := r.RaftLog.LastIndex()
+		for i := range m.Entries {
+			m.Entries[i].Index = li + 1 + uint64(i)
+			m.Entries[i].Term = r.Term
+		}
+		li = r.RaftLog.append(m.Entries...)
+		DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
+		r.Prs[r.id].Match = r.RaftLog.LastIndex()
+		r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+		// 给 follower 发送 appendEntries message
+		r.broadcastAppend()
 	}
 }
 
@@ -460,23 +528,34 @@ func tickCandidate(r *Raft, m pb.Message) {
 	case pb.MessageType_MsgRequestVoteResponse:
 		DPrintf("request vote response reply: %v", m)
 		r.votes[m.From] = !m.Reject
-		count := 0
+		reject, agree := 0, 0
 		for _, vote := range r.votes {
 			if vote {
-				count++
+				agree++
+				continue
 			}
+			reject++
 		}
-		if count > len(r.Prs)/2 {
+		if agree > len(r.Prs)/2 {
 			DPrintf("%v become leader at term %v", r.id, r.Term)
 			r.becomeLeader()
+			return
+		}
+		if reject > len(r.Prs)/2 {
+			DPrintf("%v become follower at term %v, since election fail", r.id, r.Term)
+			r.becomeFollower(m.Term, None)
 		}
 	case pb.MessageType_MsgAppend:
+		DPrintf("%v receive append entries message: %v", r.id, m)
 		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
 	}
 }
 
 func tickFollower(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgAppend:
+		DPrintf("%v receive append entries message: %v", r.id, m)
+		r.handleAppendEntries(m)
 	}
 }

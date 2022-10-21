@@ -88,44 +88,152 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
+func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
+	if len(ents) == 0 {
+		return l.LastIndex()
+	}
+	after := ents[0].Index
+	if after <= l.committed {
+		log.Panicf("Cannot overwrite logs that have been submitted!")
+	}
+	li := l.LastIndex()
+	switch {
+	case after == li+uint64(len(l.entries)):
+		for i := range ents {
+			l.entries = append(l.entries, *ents[i])
+		}
+	default:
+		l.entries = l.entries[:after-1]
+		for i := range ents {
+			l.entries = append(l.entries, *ents[i])
+		}
+		l.stabled = after - 1
+	}
+	return l.LastIndex()
+}
+
+func (l *RaftLog) Entries(lo, hi uint64) []*pb.Entry {
+	if len(l.entries) == 0 {
+		return nil
+	}
+	entries, err := l.slice(lo, hi)
+	if err != nil {
+		// TODO(bigboss) handle ErrCompact
+	}
+	result := make([]*pb.Entry, 0)
+	for i := range entries {
+		result = append(result, &entries[i])
+	}
+	return result
+}
+
 // allEntries return all the entries not compacted.
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.stabled-1:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	if l.applied == l.committed {
+		return nil
+	}
+	entries, err := l.slice(l.applied, l.committed)
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	return entries
+}
+
+func (l *RaftLog) FirstIndex() uint64 {
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	return firstIndex
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
+	if len(l.entries) != 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
 	return 0
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if len(l.entries) == 0 || i == 0 {
+		return 0, nil
+	}
+	if i > l.LastIndex() {
+		return 0, ErrUnavailable
+	}
+	return l.entries[i-1].Term, nil
 }
 
-func (l *RaftLog) appliedTo(appliedTo uint64) {
+func (l *RaftLog) matchTerm(index, term uint64) bool {
+	mt, err := l.Term(index)
+	if err != nil {
+		log.Panicf("index %v is unavailable", index)
+	}
+	return mt == term
+}
+
+func (l *RaftLog) applyTo(appliedTo uint64) {
 	if appliedTo == 0 {
 		return
 	}
 	if appliedTo < l.applied || appliedTo > l.committed {
-		panic("appliedTo a invalid index")
+		log.Panicf("applyTo a invalid index %v, apply range (%v, %v]", appliedTo, l.applied, l.committed)
 	}
 	l.applied = appliedTo
+}
+
+func (l *RaftLog) commitTo(commitTo uint64) {
+	if commitTo == 0 {
+		return
+	}
+	if commitTo > l.committed && commitTo <= l.LastIndex() {
+		l.committed = commitTo
+		return
+	}
+	log.Panicf("commit to a invalid index %v, commit range (%v, %v]", commitTo, l.committed, l.LastIndex())
+}
+
+func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	err := l.mustCheckOutOfBounds(lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	if lo == hi {
+		return nil, nil
+	}
+	return l.entries[lo-1 : hi-1], nil
+}
+
+func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
+	if lo > hi {
+		log.Panicf("invalid slice %d > %d", lo, hi)
+	}
+	fi := l.FirstIndex()
+	if lo < fi {
+		return ErrCompacted
+	}
+	length := l.LastIndex() + 1 - fi
+	if hi > fi+length {
+		log.Panicf("slice[%d,%d) out of bound [%d,%d]", lo, hi, fi, l.LastIndex())
+	}
+	return nil
 }
