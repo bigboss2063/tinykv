@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -50,13 +53,32 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	dummyIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	lastIndex, err := storage.LastIndex()
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
+	raftLog := &RaftLog{
+		storage:         storage,
+		committed:       firstIndex - 1,
+		applied:         firstIndex - 1,
+		stabled:         lastIndex,
+		entries:         entries,
+		pendingSnapshot: nil,
+		dummyIndex:      firstIndex - 1,
+	}
+	return raftLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -96,4 +118,14 @@ func (l *RaftLog) LastIndex() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	return 0, nil
+}
+
+func (l *RaftLog) appliedTo(appliedTo uint64) {
+	if appliedTo == 0 {
+		return
+	}
+	if appliedTo < l.applied || appliedTo > l.committed {
+		panic("appliedTo a invalid index")
+	}
+	l.applied = appliedTo
 }

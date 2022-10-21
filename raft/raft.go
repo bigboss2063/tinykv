@@ -16,6 +16,10 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
+	"math/rand"
+	"sync"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -36,6 +40,22 @@ var stmap = [...]string{
 	"StateFollower",
 	"StateCandidate",
 	"StateLeader",
+}
+
+type lockedRand struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (r *lockedRand) Intn(n int) int {
+	r.mu.Lock()
+	v := r.rand.Intn(n)
+	r.mu.Unlock()
+	return v
+}
+
+var globalRand = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 }
 
 func (st StateType) String() string {
@@ -143,6 +163,8 @@ type Raft struct {
 	// valid message from current leader when it is a follower.
 	electionElapsed int
 
+	randomizedElectionTimeout int
+
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
 	// (https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
@@ -165,7 +187,66 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	hardState, confState, err := c.Storage.InitialState()
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	peers := c.peers
+	if len(confState.Nodes) > 0 {
+		if len(peers) > 0 {
+			panic("cannot specify both newRaft(peers) and ConfState.Nodes)")
+		}
+		peers = confState.Nodes
+	}
+	raft := &Raft{
+		id:               c.ID,
+		Term:             None,
+		Vote:             None,
+		RaftLog:          newLog(c.Storage),
+		Prs:              make(map[uint64]*Progress),
+		State:            StateFollower,
+		votes:            make(map[uint64]bool),
+		msgs:             make([]pb.Message, 0),
+		Lead:             None,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+		heartbeatElapsed: 0,
+		electionElapsed:  0,
+		leadTransferee:   None,
+		PendingConfIndex: None,
+	}
+	for _, p := range peers {
+		raft.Prs[p] = &Progress{Match: 0, Next: 1}
+	}
+	if !(hardState.Term == None && hardState.Vote == None && hardState.Commit == None) {
+		raft.Term = hardState.Term
+		raft.Vote = hardState.Vote
+		raft.RaftLog.committed = hardState.Commit
+	}
+	raft.RaftLog.appliedTo(c.Applied)
+	raft.resetRandomizedElectionTimeout()
+	return raft
+}
+
+func (r *Raft) resetRandomizedElectionTimeout() {
+	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) sendRequestVote(to uint64) {
+	li := r.RaftLog.LastIndex()
+	term, err := r.RaftLog.Term(li)
+	if err != nil {
+		log.Panicf(err.Error())
+	}
+	message := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVote,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Index:   r.RaftLog.LastIndex(),
+		LogTerm: term,
+	}
+	r.msgs = append(r.msgs, message)
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -178,37 +259,161 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	message := pb.Message{MsgType: pb.MessageType_MsgHeartbeat, From: r.id, To: to, Commit: r.RaftLog.committed, Term: r.Term}
+	r.msgs = append(r.msgs, message)
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	switch r.State {
+	case StateLeader:
+		r.heartbeatTicker()
+	default:
+		r.electionTicker()
+	}
+}
+
+func (r *Raft) electionTicker() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.randomizedElectionTimeout {
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup, To: r.id, From: r.id})
+	}
+}
+
+func (r *Raft) heartbeatTicker() {
+	r.heartbeatElapsed++
+	r.electionElapsed++
+
+	if r.electionElapsed >= r.randomizedElectionTimeout {
+		r.electionElapsed = 0
+	}
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat, From: r.id, To: r.id})
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.State = StateFollower
+	r.Term = term
+	r.Lead = lead
+	r.Vote = None
+	r.votes = make(map[uint64]bool)
+	r.electionElapsed = 0
+	r.resetRandomizedElectionTimeout()
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	if r.State == StateLeader {
+		log.Panicf("%v can not become candidate from leader", r.id)
+	}
+	r.State = StateCandidate
+	r.Term = r.Term + 1
+	r.Vote = r.id
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
+	r.electionElapsed = 0
+	r.resetRandomizedElectionTimeout()
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	if r.State == StateFollower {
+		log.Panicf("%v can not become candidate from leader", r.id)
+	}
+	r.State = StateLeader
+	r.Lead = r.id
+	r.heartbeatElapsed = 0
+	for i := range r.Prs {
+		r.Prs[i].Match = 0
+		r.Prs[i].Next = r.RaftLog.LastIndex() + 1
+	}
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	// TODO(bigboss) 插入一条空日志
+}
+
+func (r *Raft) singleNodeCandidate() bool {
+	if _, ok := r.Prs[r.id]; ok && len(r.Prs) == 1 {
+		return true
+	}
+	return false
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	switch r.State {
-	case StateFollower:
-	case StateCandidate:
-	case StateLeader:
+	switch {
+	case m.Term == 0:
+		// 本地消息
+	case m.Term > r.Term:
+		var lead uint64
+		if m.MsgType == pb.MessageType_MsgRequestVote {
+			lead = None
+		} else {
+			lead = m.From
+		}
+		r.becomeFollower(m.Term, lead)
+	case m.Term < r.Term:
+		switch m.MsgType {
+		case pb.MessageType_MsgRequestVote:
+			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: true, Term: r.Term})
+		}
+	}
+
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		// 收到 Hup 消息，发起一轮选举
+		DPrintf("hup message: %v", m)
+		if r.State == StateLeader {
+			DPrintf("%v already became a leader", r.id)
+			return nil
+		}
+		r.becomeCandidate()
+		if r.singleNodeCandidate() {
+			r.becomeLeader()
+			return nil
+		}
+		for to := range r.Prs {
+			if to == r.id {
+				continue
+			}
+			r.sendRequestVote(to)
+		}
+	case pb.MessageType_MsgRequestVote:
+		DPrintf("request vote message: %v", m)
+		reply := pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: true, Term: r.Term}
+		if r.Vote == None || r.Vote == m.From {
+			lastLogIndex := r.RaftLog.LastIndex()
+			lastLogTerm, err := r.RaftLog.Term(lastLogIndex)
+			if err != nil {
+				r.msgs = append(r.msgs, reply)
+				return err
+			}
+			if lastLogIndex == 0 || lastLogTerm < m.LogTerm || (lastLogTerm == m.LogTerm && lastLogIndex <= m.Index) {
+				reply.Reject = false
+				r.Vote = m.From
+				r.votes[m.From] = true
+				r.electionElapsed = 0
+			}
+		}
+		r.msgs = append(r.msgs, reply)
+	default:
+		switch r.State {
+		case StateLeader:
+			tickLeader(r, m)
+		case StateCandidate:
+			tickCandidate(r, m)
+		case StateFollower:
+			tickFollower(r, m)
+		}
 	}
 	return nil
 }
@@ -236,4 +441,42 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func tickLeader(r *Raft, m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		for to := range r.Prs {
+			if to == r.id {
+				continue
+			}
+			r.sendHeartbeat(to)
+		}
+	}
+}
+
+func tickCandidate(r *Raft, m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgRequestVoteResponse:
+		DPrintf("request vote response reply: %v", m)
+		r.votes[m.From] = !m.Reject
+		count := 0
+		for _, vote := range r.votes {
+			if vote {
+				count++
+			}
+		}
+		if count > len(r.Prs)/2 {
+			DPrintf("%v become leader at term %v", r.id, r.Term)
+			r.becomeLeader()
+		}
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
+	}
+}
+
+func tickFollower(r *Raft, m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgAppend:
+	}
 }
