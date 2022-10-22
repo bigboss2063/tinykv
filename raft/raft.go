@@ -258,11 +258,19 @@ func (r *Raft) broadcastAppend() {
 	}
 }
 
+func (r *Raft) broadcastHeartbeat() {
+	for to := range r.Prs {
+		if to == r.id {
+			continue
+		}
+		r.sendHeartbeat(to)
+	}
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	DPrintf("leader %v's logs %v", r.id, r.RaftLog.entries)
 	pr := r.Prs[to]
 	li := r.RaftLog.LastIndex()
 	var prevLogIndex uint64
@@ -294,7 +302,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	message := pb.Message{MsgType: pb.MessageType_MsgHeartbeat, From: r.id, To: to, Commit: r.RaftLog.committed, Term: r.Term}
+	message := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		From:    r.id, To: to,
+		Commit: min(r.RaftLog.committed, r.Prs[to].Match), // 如果它没有这么长则不能提交到 leader 的 commit 的位置
+		Term:   r.Term,
+	}
 	r.msgs = append(r.msgs, message)
 }
 
@@ -377,7 +390,7 @@ func (r *Raft) becomeLeader() {
 	r.broadcastAppend()
 }
 
-func (r *Raft) singleNodeCandidate() bool {
+func (r *Raft) isSingleNode() bool {
 	if _, ok := r.Prs[r.id]; ok && len(r.Prs) == 1 {
 		return true
 	}
@@ -403,6 +416,10 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType {
 		case pb.MessageType_MsgRequestVote:
 			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: true, Term: r.Term})
+		case pb.MessageType_MsgAppend:
+			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgAppendResponse, From: r.id, To: m.From, Term: r.Term})
+		case pb.MessageType_MsgHeartbeat:
+			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse, From: r.id, To: m.From, Term: r.Term})
 		}
 	}
 
@@ -415,7 +432,7 @@ func (r *Raft) Step(m pb.Message) error {
 			return nil
 		}
 		r.becomeCandidate()
-		if r.singleNodeCandidate() {
+		if r.isSingleNode() {
 			r.becomeLeader()
 			return nil
 		}
@@ -459,7 +476,6 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	r.electionElapsed = 0
 	resp := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		To:      m.From,
@@ -470,7 +486,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if li < m.Index {
 		resp.Reject = true
 		resp.Index = r.RaftLog.LastIndex() + 1
-
 		r.msgs = append(r.msgs, resp)
 		DPrintf("%v's logs are short than leader, last log index %v", r.id, r.RaftLog.LastIndex())
 		return
@@ -502,7 +517,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
 		}
 		if r.RaftLog.committed < m.Commit {
-			r.RaftLog.commitTo(min(m.Commit, r.RaftLog.LastIndex()))
+			r.RaftLog.commitTo(min(m.Commit, m.Index+uint64(len(m.Entries))))
 			DPrintf("%v change committed to %v", r.id, r.RaftLog.committed)
 		}
 	} else {
@@ -525,6 +540,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	resp := pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse, To: m.From, From: r.id, Term: r.Term, Reject: false}
+	committed := r.RaftLog.commitTo(m.Commit)
+	if committed {
+		DPrintf("%v change committed to %v", r.id, r.RaftLog.committed)
+	}
+	r.msgs = append(r.msgs, resp)
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -546,12 +567,7 @@ func tickLeader(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		DPrintf("%v receive beat message: %v", r.id, m)
-		for to := range r.Prs {
-			if to == r.id {
-				continue
-			}
-			r.sendHeartbeat(to)
-		}
+		r.broadcastHeartbeat()
 	case pb.MessageType_MsgPropose:
 		DPrintf("%v receive propose message: %v", r.id, m)
 		if len(m.Entries) == 0 {
@@ -563,11 +579,19 @@ func tickLeader(r *Raft, m pb.Message) {
 			m.Entries[i].Term = r.Term
 		}
 		li = r.RaftLog.append(m.Entries...)
+		r.Prs[r.id].Match = li
+		r.Prs[r.id].Next = li + 1
+		if r.isSingleNode() {
+			r.RaftLog.commitTo(li)
+		}
 		DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
-		r.Prs[r.id].Match = r.RaftLog.LastIndex()
-		r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 		// 给 follower 发送 appendEntries message
 		r.broadcastAppend()
+	case pb.MessageType_MsgHeartbeatResponse:
+		DPrintf("%v receive heartbeat response msg %v", r.id, m)
+		if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+			r.sendAppend(m.From)
+		}
 	case pb.MessageType_MsgAppendResponse:
 		DPrintf("%v receive append response msg %v", r.id, m)
 		switch m.Reject {
@@ -595,7 +619,22 @@ func tickLeader(r *Raft, m pb.Message) {
 		case false:
 			r.Prs[m.From].Match = m.Index
 			r.Prs[m.From].Next = r.Prs[m.From].Match + 1
-			// TODO(bigboss) 尝试提交日志
+			savedCommitted := r.RaftLog.committed
+			for N := r.RaftLog.LastIndex(); N >= r.RaftLog.FirstIndex(); N-- {
+				matchCount := 1
+				for i := range r.Prs {
+					if r.Prs[i].Match >= N && i != r.id {
+						matchCount++
+					}
+				}
+				term, _ := r.RaftLog.Term(N)
+				if matchCount > len(r.Prs)/2 && term == r.Term && N > savedCommitted {
+					r.RaftLog.commitTo(N)
+					DPrintf("%v commit to %v at term %v, logs %v %v", r.id, N, r.Term, r.RaftLog.entries, savedCommitted)
+					r.broadcastAppend()
+					break
+				}
+			}
 		}
 	}
 }
@@ -626,6 +665,10 @@ func tickCandidate(r *Raft, m pb.Message) {
 		DPrintf("%v receive append entries message: %v", r.id, m)
 		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		DPrintf("%v receive heartbeat msg: %v", r.id, m)
+		r.becomeFollower(m.Term, m.From)
+		r.handleHeartbeat(m)
 	}
 }
 
@@ -633,6 +676,13 @@ func tickFollower(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgAppend:
 		DPrintf("%v receive append entries message: %v", r.id, m)
+		r.Lead = m.From
+		r.electionElapsed = 0
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		DPrintf("%v receive heartbeat message: %v", r.id, m)
+		r.Lead = m.From
+		r.electionElapsed = 0
+		r.handleHeartbeat(m)
 	}
 }

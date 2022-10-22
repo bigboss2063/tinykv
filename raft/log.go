@@ -99,15 +99,19 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 	li := l.LastIndex()
 	switch {
 	case after == li+uint64(len(l.entries)):
+		// 新日志跟在后面则直接接上
 		for i := range ents {
 			l.entries = append(l.entries, *ents[i])
 		}
 	default:
+		// 否则需要拼接一下
 		l.entries = l.entries[:after-1]
 		for i := range ents {
 			l.entries = append(l.entries, *ents[i])
 		}
-		l.stabled = after - 1
+		if l.stabled >= after {
+			l.stabled = after - 1
+		}
 	}
 	return l.LastIndex()
 }
@@ -138,7 +142,10 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries[l.stabled-1:]
+	if len(l.entries) == 0 {
+		return nil
+	}
+	return l.entries[l.stabled:]
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -147,11 +154,11 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if l.applied == l.committed {
 		return nil
 	}
-	entries, err := l.slice(l.applied, l.committed)
+	ents, err := l.slice(l.applied+1, l.committed+1)
 	if err != nil {
 		log.Panicf(err.Error())
 	}
-	return entries
+	return
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
@@ -201,15 +208,15 @@ func (l *RaftLog) applyTo(appliedTo uint64) {
 	l.applied = appliedTo
 }
 
-func (l *RaftLog) commitTo(commitTo uint64) {
-	if commitTo == 0 {
-		return
-	}
-	if commitTo > l.committed && commitTo <= l.LastIndex() {
+func (l *RaftLog) commitTo(commitTo uint64) bool {
+	if l.committed < commitTo {
+		if l.LastIndex() < commitTo {
+			log.Panicf("commitTo %v can't bigger than lastIndex %v", commitTo, l.LastIndex())
+		}
 		l.committed = commitTo
-		return
+		return true
 	}
-	log.Panicf("commit to a invalid index %v, commit range (%v, %v]", commitTo, l.committed, l.LastIndex())
+	return false
 }
 
 func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
