@@ -186,7 +186,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 func (l *RaftLog) matchTerm(index, term uint64) bool {
 	mt, err := l.Term(index)
 	if err != nil {
-		log.Panicf("index %v is unavailable", index)
+		return false
 	}
 	return mt == term
 }

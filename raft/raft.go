@@ -262,6 +262,7 @@ func (r *Raft) broadcastAppend() {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	DPrintf("leader %v's logs %v", r.id, r.RaftLog.entries)
 	pr := r.Prs[to]
 	li := r.RaftLog.LastIndex()
 	var prevLogIndex uint64
@@ -285,6 +286,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Entries: entries,
 		Commit:  r.RaftLog.committed,
 	}
+	DPrintf("leader %v send append entries to %v, %v", r.id, to, message)
 	r.msgs = append(r.msgs, message)
 	return true
 }
@@ -368,7 +370,6 @@ func (r *Raft) becomeLeader() {
 		r.Prs[i].Match = 0
 		r.Prs[i].Next = r.RaftLog.LastIndex() + 1
 	}
-	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.RaftLog.append(&pb.Entry{Index: r.RaftLog.LastIndex() + 1, Term: r.Term})
 	// 为什么要更新自己的 progress ？不更新过不了测试
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
@@ -458,20 +459,67 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	if r.RaftLog.matchTerm(m.Index, m.LogTerm) {
-		li := r.RaftLog.LastIndex()
-		for i := range m.Entries {
-			m.Entries[i].Index = li + 1 + uint64(i)
-			m.Entries[i].Term = r.Term
-		}
-		li = r.RaftLog.append(m.Entries...)
-		r.Prs[r.id].Match = r.RaftLog.LastIndex()
-		r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
-		DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
-	} else {
-		// TODO(bigboss) 当日志和 leader 有冲突时用 leader 的日志覆盖
+	r.electionElapsed = 0
+	resp := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
 	}
+	li := r.RaftLog.LastIndex()
+	if li < m.Index {
+		resp.Reject = true
+		resp.Index = r.RaftLog.LastIndex() + 1
 
+		r.msgs = append(r.msgs, resp)
+		DPrintf("%v's logs are short than leader, last log index %v", r.id, r.RaftLog.LastIndex())
+		return
+	}
+	if r.RaftLog.matchTerm(m.Index, m.LogTerm) {
+		resp.Reject = false
+		resp.Index = m.Index + uint64(len(m.Entries))
+		logInsertIndex := m.Index + 1
+		newEntriesIndex := 0
+		for {
+			if logInsertIndex >= li || newEntriesIndex >= len(m.Entries) {
+				break
+			}
+			term, err := r.RaftLog.Term(logInsertIndex)
+			if err != nil {
+				log.Panicf("index %v ErrUnavailable", logInsertIndex)
+			}
+			if term != m.Entries[newEntriesIndex].Term {
+				break
+			}
+			logInsertIndex++
+			newEntriesIndex++
+		}
+		if newEntriesIndex < len(m.Entries) {
+			m.Entries = m.Entries[newEntriesIndex:]
+			li = r.RaftLog.append(m.Entries...)
+			r.Prs[r.id].Match = r.RaftLog.LastIndex()
+			r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+			DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
+		}
+		if r.RaftLog.committed < m.Commit {
+			r.RaftLog.commitTo(min(m.Commit, r.RaftLog.LastIndex()))
+			DPrintf("%v change committed to %v", r.id, r.RaftLog.committed)
+		}
+	} else {
+		resp.Reject = true
+		term, _ := r.RaftLog.Term(m.Index)
+		resp.LogTerm = term
+		resp.Index = m.Index
+		// 找出冲突日志所在任期的第一条日志的索引
+		for idx := m.Index; idx >= r.RaftLog.FirstIndex(); idx-- {
+			if !r.RaftLog.matchTerm(idx, term) {
+				resp.Index = idx + 1
+				break
+			}
+		}
+		DPrintf("%v conflict with leader at %v", r.id, resp.Index)
+	}
+	r.msgs = append(r.msgs, resp)
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -520,6 +568,35 @@ func tickLeader(r *Raft, m pb.Message) {
 		r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 		// 给 follower 发送 appendEntries message
 		r.broadcastAppend()
+	case pb.MessageType_MsgAppendResponse:
+		DPrintf("%v receive append response msg %v", r.id, m)
+		switch m.Reject {
+		case true:
+			// 如果 logTerm 等于 0 表示 follower 在 pervLogIndex 位置没有日志，将 next 设置为 follower 的 lastIndex + 1
+			if m.LogTerm == 0 {
+				r.Prs[m.From].Next = m.Index
+			} else {
+				lastIndexOfTerm := uint64(0)
+				for i := r.RaftLog.LastIndex(); i >= r.RaftLog.FirstIndex(); i-- {
+					if term, _ := r.RaftLog.Term(i); term == m.LogTerm {
+						lastIndexOfTerm = i
+						break
+					}
+				}
+				// leader 有冲突任期的日志，那么把冲突任期后面任期的日志都发过去
+				if lastIndexOfTerm > 0 {
+					r.Prs[m.From].Next = lastIndexOfTerm + 1
+				} else {
+					// 否则将包括 follower 冲突任期的第一条日志所在的索引位置和之后的日志全部发过去
+					r.Prs[m.From].Next = m.Index
+				}
+			}
+			r.sendAppend(m.From)
+		case false:
+			r.Prs[m.From].Match = m.Index
+			r.Prs[m.From].Next = r.Prs[m.From].Match + 1
+			// TODO(bigboss) 尝试提交日志
+		}
 	}
 }
 
