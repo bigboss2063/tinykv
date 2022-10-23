@@ -206,7 +206,6 @@ func newRaft(c *Config) *Raft {
 		Prs:              make(map[uint64]*Progress),
 		State:            StateFollower,
 		votes:            make(map[uint64]bool),
-		msgs:             make([]pb.Message, 0),
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
@@ -218,7 +217,7 @@ func newRaft(c *Config) *Raft {
 	for _, p := range peers {
 		raft.Prs[p] = &Progress{Match: 0, Next: 1}
 	}
-	if !(hardState.Term == None && hardState.Vote == None && hardState.Commit == None) {
+	if !IsEmptyHardState(hardState) {
 		raft.Term = hardState.Term
 		raft.Vote = hardState.Vote
 		raft.RaftLog.committed = hardState.Commit
@@ -228,8 +227,36 @@ func newRaft(c *Config) *Raft {
 	return raft
 }
 
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
 func (r *Raft) resetRandomizedElectionTimeout() {
 	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) advance(rd Ready) {
+	if newApplied := rd.appliedCursor(); newApplied > 0 {
+		r.RaftLog.applyTo(newApplied)
+	}
+	if len(rd.Entries) > 0 {
+		e := rd.Entries[len(rd.Entries)-1]
+		if r.id == r.Lead {
+			r.Step(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, From: r.id, Index: e.Index})
+		}
+		r.RaftLog.stableTo(e.Index)
+	}
 }
 
 func (r *Raft) sendRequestVote(to uint64) {
@@ -387,6 +414,11 @@ func (r *Raft) becomeLeader() {
 	// 为什么要更新自己的 progress ？不更新过不了测试
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+	// 也有可能只有单独一个节点了，跟 propose 的时候一样直接提交
+	if r.isSingleNode() {
+		r.RaftLog.commitTo(r.RaftLog.LastIndex())
+		return
+	}
 	r.broadcastAppend()
 }
 

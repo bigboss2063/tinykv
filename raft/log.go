@@ -244,3 +244,13 @@ func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
 	}
 	return nil
 }
+
+func (l *RaftLog) stableTo(i uint64) {
+	if i > l.stabled {
+		l.stabled = i
+	}
+}
+
+func (l *RaftLog) hasPendingSnapshot() bool {
+	return l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index != 0
+}
