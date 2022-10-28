@@ -321,7 +321,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Entries: entries,
 		Commit:  r.RaftLog.committed,
 	}
-	DPrintf("leader %v send append entries to %v, %v", r.id, to, message)
 	r.msgs = append(r.msgs, message)
 	return true
 }
@@ -352,6 +351,7 @@ func (r *Raft) tick() {
 func (r *Raft) electionTicker() {
 	r.electionElapsed++
 	if r.electionElapsed >= r.randomizedElectionTimeout {
+		r.electionElapsed = 0
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup, To: r.id, From: r.id})
 	}
 }
@@ -365,6 +365,7 @@ func (r *Raft) heartbeatTicker() {
 	}
 
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat, From: r.id, To: r.id})
 	}
 }
@@ -489,6 +490,7 @@ func (r *Raft) Step(m pb.Message) error {
 				r.Vote = m.From
 				r.votes[m.From] = true
 				r.electionElapsed = 0
+				DPrintf("%v vote for %v at term %v", r.id, m.From, r.Term)
 			}
 		}
 		r.msgs = append(r.msgs, reply)
@@ -513,6 +515,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		To:      m.From,
 		From:    r.id,
 		Term:    r.Term,
+	}
+	if m.Index < r.RaftLog.committed {
+		resp.Index = r.RaftLog.committed
+		r.msgs = append(r.msgs, resp)
+		return
 	}
 	li := r.RaftLog.LastIndex()
 	if li < m.Index {
@@ -546,7 +553,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			li = r.RaftLog.append(m.Entries...)
 			r.Prs[r.id].Match = r.RaftLog.LastIndex()
 			r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
-			DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
 		}
 		if r.RaftLog.committed < m.Commit {
 			r.RaftLog.commitTo(min(m.Commit, m.Index+uint64(len(m.Entries))))
@@ -616,7 +622,6 @@ func tickLeader(r *Raft, m pb.Message) {
 		if r.isSingleNode() {
 			r.RaftLog.commitTo(li)
 		}
-		DPrintf("%v append entries: %v lastIndex: %v", r.id, m.Entries, li)
 		// 给 follower 发送 appendEntries message
 		r.broadcastAppend()
 	case pb.MessageType_MsgHeartbeatResponse:

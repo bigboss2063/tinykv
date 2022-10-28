@@ -105,7 +105,7 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 		}
 	default:
 		// 否则需要拼接一下
-		l.entries = l.entries[:after-1]
+		l.entries = l.entries[:after-l.dummyIndex-1]
 		for i := range ents {
 			l.entries = append(l.entries, *ents[i])
 		}
@@ -145,7 +145,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	if len(l.entries) == 0 {
 		return nil
 	}
-	return l.entries[l.stabled:]
+	return l.entries[l.stabled-l.dummyIndex:]
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -172,22 +172,26 @@ func (l *RaftLog) FirstIndex() uint64 {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	if len(l.entries) != 0 {
-		return l.entries[len(l.entries)-1].Index
+	if length := len(l.entries); length != 0 {
+		return l.dummyIndex + uint64(length)
 	}
-	return 0
+	li, err := l.storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	return li
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 || i == 0 {
+	if i < l.dummyIndex || i > l.LastIndex() {
 		return 0, nil
 	}
-	if i > l.LastIndex() {
-		return 0, ErrUnavailable
+	if i == l.dummyIndex {
+		return l.storage.Term(i)
 	}
-	return l.entries[i-1].Term, nil
+	return l.entries[i-l.dummyIndex-1].Term, nil
 }
 
 func (l *RaftLog) matchTerm(index, term uint64) bool {
@@ -227,7 +231,7 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	if lo == hi {
 		return nil, nil
 	}
-	return l.entries[lo-1 : hi-1], nil
+	return l.entries[lo-l.dummyIndex-1 : hi-l.dummyIndex-1], nil
 }
 
 func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
