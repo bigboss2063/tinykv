@@ -42,19 +42,28 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
+	log.Debugf("%v begin handle a raft ready", d.ctx.store.Id)
+	defer func() {
+		log.Debugf("%v end handle a raft ready", d.ctx.store.Id)
+	}()
 	if d.stopped {
+		log.Debugf("%v already stopped", d.ctx.store.Id)
 		return
 	}
 	// Your Code Here (2B).
 	if !d.RaftGroup.HasReady() {
+		log.Debugf("%v there is no ready", d.ctx.store.Id)
 		return
 	}
 	ready := d.RaftGroup.Ready()
 	_, _ = d.peerStorage.SaveReadyState(&ready)
+	log.Debugf("%v prepare to send msgs", d.ctx.store.Id)
 	d.Send(d.ctx.trans, ready.Messages)
+	log.Debugf("%v send msgs", d.ctx.store.Id)
 	if len(ready.CommittedEntries) > 0 {
+		log.Debugf("%v has committed entries len %v", d.ctx.store.Id, len(ready.CommittedEntries))
+		kvWB := new(engine_util.WriteBatch)
 		for _, entry := range ready.CommittedEntries {
-			kvWB := new(engine_util.WriteBatch)
 			raftReq := &raft_cmdpb.RaftCmdRequest{}
 			raftResp := newCmdResp()
 			err := raftReq.Unmarshal(entry.Data)
@@ -69,15 +78,18 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					prop = d.proposals[0]
 					if prop.index == entry.Index && prop.term == entry.Term {
 						// 找到对应的 proposal 用于回复 callback
+						log.Debugf("%v find proposal for index %v", d.ctx.store.Id, entry.Index)
 						d.proposals = d.proposals[1:]
 						break
 					}
 					d.proposals = d.proposals[1:]
 					prop.cb.Done(ErrRespStaleCommand(entry.Term))
+					prop = nil
 				}
 				for _, req := range raftReq.Requests {
 					switch req.CmdType {
 					case raft_cmdpb.CmdType_Get:
+						log.Debugf("%v prepare to apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
 						d.peerStorage.applyState.AppliedIndex = entry.Index
 						err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 						if err != nil {
@@ -85,18 +97,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 						}
 						kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 						kvWB.Reset()
+						log.Debugf("%v apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
 						if prop != nil {
+							log.Infof("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
 							val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
 							if err != nil {
 								panic(err)
 							}
-							raftResp.Responses = []*raft_cmdpb.Response{{
+							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
 								CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{
 									Value: val,
 								},
-							}}
+							})
 						}
 					case raft_cmdpb.CmdType_Snap:
+						log.Debugf("%v prepare to apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
 						d.peerStorage.applyState.AppliedIndex = entry.Index
 						err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 						if err != nil {
@@ -104,25 +119,27 @@ func (d *peerMsgHandler) HandleRaftReady() {
 						}
 						kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 						kvWB.Reset()
+						log.Debugf("%v apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
 						if prop != nil {
+							log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
 							txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-							raftResp.Responses = []*raft_cmdpb.Response{
-								{
-									CmdType: raft_cmdpb.CmdType_Snap,
-									Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
-								},
-							}
+							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+								CmdType: raft_cmdpb.CmdType_Snap,
+								Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+							})
 						}
 					case raft_cmdpb.CmdType_Put:
 						kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-						raftResp.Responses = []*raft_cmdpb.Response{{
+						log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
+						raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
 							CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
-						}}
+						})
 					case raft_cmdpb.CmdType_Delete:
 						kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-						raftResp.Responses = []*raft_cmdpb.Response{{
+						log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
+						raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
 							CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
-						}}
+						})
 					default:
 						panic("err type of cmd!")
 					}
@@ -130,20 +147,29 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				if prop != nil {
 					prop.cb.Txn = txn
 					prop.cb.Done(raftResp)
+					log.Debugf("%v finish to handle raft cmd", d.ctx.store.Id)
 				}
 			}
-			d.peerStorage.applyState.AppliedIndex = entry.Index
-			err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-			if err != nil {
-				panic(err)
-			}
-			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 		}
+		log.Debugf("%v prepare to write applyState to disk", d.ctx.store.Id)
+		d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			panic(err)
+		}
+		kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+		log.Debugf("%v write applyState to disk", d.ctx.store.Id)
 	}
+	log.Debugf("%v prepare to advance", d.ctx.store.Id)
 	d.RaftGroup.Advance(ready)
+	log.Debugf("%v advance", d.ctx.store.Id)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
+	log.Debugf("%v begin handle a msg", d.ctx.store.Id)
+	defer func() {
+		log.Debugf("%v end handle a msg", d.ctx.store.Id)
+	}()
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
 		raftMsg := msg.Data.(*rspb.RaftMessage)
@@ -221,11 +247,12 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		term:  d.Term(),
 		cb:    cb,
 	}
-	d.proposals = append(d.proposals, prop)
 	err = d.RaftGroup.Propose(data)
 	if err != nil {
 		// TODO(bigboss) handle err
+		panic(err)
 	}
+	d.proposals = append(d.proposals, prop)
 }
 
 func (d *peerMsgHandler) onTick() {
