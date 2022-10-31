@@ -306,11 +306,27 @@ func (r *Raft) sendAppend(to uint64) bool {
 	} else {
 		prevLogIndex = pr.Next - 1
 	}
-	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
-	if err != nil {
-		log.Panicf(err.Error())
+	prevLogTerm, tErr := r.RaftLog.Term(prevLogIndex)
+	entries, eErr := r.RaftLog.Entries(prevLogIndex+1, r.RaftLog.LastIndex()+1)
+	// Term 和 Entries 方法只会返回 ErrCompacted，表示要发送的日志已经被压缩成快照了，所以要发送快照
+	if tErr != nil || eErr != nil {
+		message := pb.Message{MsgType: pb.MessageType_MsgSnapshot, To: to, From: r.id, Term: r.Term}
+		snapshot, err := r.RaftLog.Snapshot()
+		if err != nil {
+			// 快照还没准备好，等待下一次发送
+			if err == ErrSnapshotTemporarilyUnavailable {
+				DPrintf("%v failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return false
+			}
+			panic(err)
+		}
+		if IsEmptySnap(&snapshot) {
+			panic("need non-empty snapshot")
+		}
+		message.Snapshot = &snapshot
+		r.msgs = append(r.msgs, message)
+		return true
 	}
-	entries := r.RaftLog.Entries(prevLogIndex+1, r.RaftLog.LastIndex()+1)
 	message := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		To:      to,
@@ -589,6 +605,44 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	sIndex, sTerm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	message := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      m.From,
+		Term:    r.Term,
+	}
+	if r.restore(m.Snapshot) {
+		DPrintf("%v [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sIndex, sTerm)
+		message.Index = r.RaftLog.LastIndex()
+	} else {
+		DPrintf("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sIndex, sTerm)
+		message.Index = r.RaftLog.committed
+	}
+	r.msgs = append(r.msgs, message)
+}
+
+func (r *Raft) restore(s *pb.Snapshot) bool {
+	if s.Metadata.Index <= r.RaftLog.committed {
+		return false
+	}
+	if r.RaftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
+		// 通过 matchTerm 方法，说明当前节点中已经有快照中的日志，不需要进行 restore，直接同步 committed 即可
+		r.RaftLog.commitTo(s.Metadata.Index)
+		return false
+	}
+	r.RaftLog.Restore(s)
+	r.Prs = make(map[uint64]*Progress)
+	for _, n := range s.Metadata.ConfState.Nodes {
+		match, next := uint64(0), r.RaftLog.LastIndex()+1
+		if n == r.id {
+			match = next - 1
+		}
+		r.Prs[n] = &Progress{Match: match, Next: next}
+	}
+	return true
 }
 
 // addNode add a new node to raft group
@@ -706,6 +760,10 @@ func tickCandidate(r *Raft, m pb.Message) {
 		DPrintf("%v receive heartbeat msg: %v", r.id, m)
 		r.becomeFollower(m.Term, m.From)
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		DPrintf("%v receive snapshot message: %v", r.id, m)
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
 	}
 }
 
@@ -721,5 +779,10 @@ func tickFollower(r *Raft, m pb.Message) {
 		r.Lead = m.From
 		r.electionElapsed = 0
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		DPrintf("%v receive snapshot message: %v", r.id, m)
+		r.Lead = m.From
+		r.electionElapsed = 0
+		r.handleSnapshot(m)
 	}
 }

@@ -130,16 +130,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
 						}
 					case raft_cmdpb.CmdType_Put:
 						kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-						log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
-						raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-							CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
-						})
+						if prop != nil {
+							log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
+							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+								CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
+							})
+						}
 					case raft_cmdpb.CmdType_Delete:
 						kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-						log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
-						raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-							CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
-						})
+						if prop != nil {
+							log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
+							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+								CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
+							})
+						}
 					default:
 						panic("err type of cmd!")
 					}

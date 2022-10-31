@@ -116,19 +116,19 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 	return l.LastIndex()
 }
 
-func (l *RaftLog) Entries(lo, hi uint64) []*pb.Entry {
+func (l *RaftLog) Entries(lo, hi uint64) ([]*pb.Entry, error) {
 	if len(l.entries) == 0 {
-		return nil
+		return nil, nil
 	}
 	entries, err := l.slice(lo, hi)
 	if err != nil {
-		// TODO(bigboss) handle ErrCompact
+		return nil, err
 	}
 	result := make([]*pb.Entry, 0)
 	for i := range entries {
 		result = append(result, &entries[i])
 	}
-	return result
+	return result, nil
 }
 
 // allEntries return all the entries not compacted.
@@ -162,9 +162,15 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
+	if len(l.entries) != 0 {
+		return l.entries[0].Index
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
 	firstIndex, err := l.storage.FirstIndex()
 	if err != nil {
-		log.Panicf(err.Error())
+		panic(err)
 	}
 	return firstIndex
 }
@@ -174,6 +180,9 @@ func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if length := len(l.entries); length != 0 {
 		return l.dummyIndex + uint64(length)
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index
 	}
 	li, err := l.storage.LastIndex()
 	if err != nil {
@@ -188,8 +197,18 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if i < l.dummyIndex || i > l.LastIndex() {
 		return 0, nil
 	}
+	if l.pendingSnapshot != nil {
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		} else if i < l.pendingSnapshot.Metadata.Index {
+			return 0, ErrCompacted
+		}
+	}
 	if i == l.dummyIndex {
 		return l.storage.Term(i)
+	}
+	if len(l.entries) == 0 {
+		return 0, nil
 	}
 	return l.entries[i-l.dummyIndex-1].Term, nil
 }
@@ -255,6 +274,27 @@ func (l *RaftLog) stableTo(i uint64) {
 	}
 }
 
+func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		l.pendingSnapshot = nil
+	}
+}
+
 func (l *RaftLog) hasPendingSnapshot() bool {
 	return l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index != 0
+}
+
+func (l *RaftLog) Snapshot() (pb.Snapshot, error) {
+	if l.pendingSnapshot != nil {
+		return *l.pendingSnapshot, nil
+	}
+	return l.storage.Snapshot()
+}
+
+func (l *RaftLog) Restore(s *pb.Snapshot) {
+	l.committed = s.Metadata.Index
+	l.dummyIndex = s.Metadata.Index
+	l.stabled = s.Metadata.Index
+	l.entries = nil
+	l.pendingSnapshot = s
 }
