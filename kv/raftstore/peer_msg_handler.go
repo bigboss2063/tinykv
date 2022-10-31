@@ -5,6 +5,7 @@ import (
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -65,94 +66,13 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		kvWB := new(engine_util.WriteBatch)
 		for _, entry := range ready.CommittedEntries {
 			raftReq := &raft_cmdpb.RaftCmdRequest{}
-			raftResp := newCmdResp()
-			err := raftReq.Unmarshal(entry.Data)
-			if err != nil {
-				panic(err)
-			}
+			_ = raftReq.Unmarshal(entry.Data)
 			if len(raftReq.Requests) > 0 {
-				// Normal Request
-				var prop *proposal
-				var txn *badger.Txn
-				for len(d.proposals) > 0 {
-					prop = d.proposals[0]
-					if prop.index == entry.Index && prop.term == entry.Term {
-						// 找到对应的 proposal 用于回复 callback
-						log.Debugf("%v find proposal for index %v", d.ctx.store.Id, entry.Index)
-						d.proposals = d.proposals[1:]
-						break
-					}
-					d.proposals = d.proposals[1:]
-					prop.cb.Done(ErrRespStaleCommand(entry.Term))
-					prop = nil
-				}
-				for _, req := range raftReq.Requests {
-					switch req.CmdType {
-					case raft_cmdpb.CmdType_Get:
-						log.Debugf("%v prepare to apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
-						d.peerStorage.applyState.AppliedIndex = entry.Index
-						err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-						if err != nil {
-							panic(err)
-						}
-						kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-						kvWB.Reset()
-						log.Debugf("%v apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
-						if prop != nil {
-							log.Infof("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
-							val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
-							if err != nil {
-								panic(err)
-							}
-							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-								CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{
-									Value: val,
-								},
-							})
-						}
-					case raft_cmdpb.CmdType_Snap:
-						log.Debugf("%v prepare to apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
-						d.peerStorage.applyState.AppliedIndex = entry.Index
-						err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-						if err != nil {
-							panic(err)
-						}
-						kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-						kvWB.Reset()
-						log.Debugf("%v apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
-						if prop != nil {
-							log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
-							txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-								CmdType: raft_cmdpb.CmdType_Snap,
-								Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
-							})
-						}
-					case raft_cmdpb.CmdType_Put:
-						kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-						if prop != nil {
-							log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
-							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-								CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
-							})
-						}
-					case raft_cmdpb.CmdType_Delete:
-						kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-						if prop != nil {
-							log.Debugf("%v set resp for cmd index %v", d.ctx.store.Id, entry.Index)
-							raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-								CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
-							})
-						}
-					default:
-						panic("err type of cmd!")
-					}
-				}
-				if prop != nil {
-					prop.cb.Txn = txn
-					prop.cb.Done(raftResp)
-					log.Debugf("%v finish to handle raft cmd", d.ctx.store.Id)
-				}
+				raftResp := newCmdResp()
+				prop := d.findProposal(&entry)
+				d.handleNormalRequest(raftReq, raftResp, kvWB, entry, prop)
+			} else if raftReq.AdminRequest != nil {
+				d.handleAdminRequest(raftReq, kvWB, entry)
 			}
 		}
 		log.Debugf("%v prepare to write applyState to disk", d.ctx.store.Id)
@@ -167,6 +87,100 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	log.Debugf("%v prepare to advance", d.ctx.store.Id)
 	d.RaftGroup.Advance(ready)
 	log.Debugf("%v advance", d.ctx.store.Id)
+}
+
+func (d *peerMsgHandler) findProposal(entry *pb.Entry) *proposal {
+	var prop *proposal
+	for len(d.proposals) > 0 {
+		prop = d.proposals[0]
+		if prop.index == entry.Index && prop.term == entry.Term {
+			// 找到对应的 proposal 用于回复 callback
+			log.Debugf("%v find proposal for index %v", d.ctx.store.Id, entry.Index)
+			d.proposals = d.proposals[1:]
+			break
+		}
+		d.proposals = d.proposals[1:]
+		prop.cb.Done(ErrRespStaleCommand(entry.Term))
+		prop = nil
+	}
+	return prop
+}
+
+func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest, raftResp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch, entry pb.Entry, prop *proposal) {
+	// Normal Request
+	var txn *badger.Txn
+	for _, req := range raftReq.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			log.Debugf("%v prepare to apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
+			d.peerStorage.applyState.AppliedIndex = entry.Index
+			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				panic(err)
+			}
+			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+			kvWB.Reset()
+			log.Debugf("%v apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
+			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+			if err != nil {
+				panic(err)
+			}
+			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{
+					Value: val,
+				},
+			})
+		case raft_cmdpb.CmdType_Snap:
+			log.Debugf("%v prepare to apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
+			d.peerStorage.applyState.AppliedIndex = entry.Index
+			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				panic(err)
+			}
+			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+			kvWB.Reset()
+			log.Debugf("%v apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
+			txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+			})
+		case raft_cmdpb.CmdType_Put:
+			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
+			})
+		case raft_cmdpb.CmdType_Delete:
+			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
+			})
+		default:
+			panic("err type of cmd!")
+		}
+	}
+	if prop != nil {
+		prop.cb.Txn = txn
+		prop.cb.Done(raftResp)
+		log.Debugf("%v finish to handle raft cmd", d.ctx.store.Id)
+	}
+}
+
+func (d *peerMsgHandler) handleAdminRequest(raftReq *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch, entry pb.Entry) {
+	log.Debugf("%v begin handle admin request %v", d.ctx.store.Id, raftReq.AdminRequest)
+	switch raftReq.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		log.Debugf("%v receive a compact log cmd", d.ctx.store.Id)
+		d.peerStorage.applyState.TruncatedState.Index = raftReq.AdminRequest.CompactLog.CompactIndex
+		d.peerStorage.applyState.TruncatedState.Term = raftReq.AdminRequest.CompactLog.CompactTerm
+		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			panic(err)
+		}
+		kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+		kvWB.Reset()
+		d.ScheduleCompactLog(raftReq.AdminRequest.CompactLog.CompactIndex)
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {

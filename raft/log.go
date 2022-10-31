@@ -154,11 +154,16 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if l.applied == l.committed {
 		return nil
 	}
-	ents, err := l.slice(l.applied+1, l.committed+1)
-	if err != nil {
-		log.Panicf(err.Error())
+	// 如果 applied + 1 的那条日志已经被压缩了，那就没办法拿到了会直接 panic，所有要比较一下跟 firstIndex 谁比较大
+	offset := max(l.applied+1, l.FirstIndex())
+	if l.committed+1 > offset {
+		ents, err := l.slice(offset, l.committed+1)
+		if err != nil {
+			log.Panicf(err.Error())
+		}
+		return ents
 	}
-	return
+	return nil
 }
 
 func (l *RaftLog) FirstIndex() uint64 {

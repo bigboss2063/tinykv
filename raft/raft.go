@@ -257,6 +257,9 @@ func (r *Raft) advance(rd Ready) {
 		}
 		r.RaftLog.stableTo(e.Index)
 	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
+	}
 }
 
 func (r *Raft) sendRequestVote(to uint64) {
@@ -324,6 +327,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 			panic("need non-empty snapshot")
 		}
 		message.Snapshot = &snapshot
+		DPrintf("%v send snapshot to %v", r.id, to)
 		r.msgs = append(r.msgs, message)
 		return true
 	}
@@ -567,8 +571,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		if newEntriesIndex < len(m.Entries) {
 			m.Entries = m.Entries[newEntriesIndex:]
 			li = r.RaftLog.append(m.Entries...)
-			r.Prs[r.id].Match = r.RaftLog.LastIndex()
-			r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 		}
 		if r.RaftLog.committed < m.Commit {
 			r.RaftLog.commitTo(min(m.Commit, m.Index+uint64(len(m.Entries))))
@@ -636,12 +638,9 @@ func (r *Raft) restore(s *pb.Snapshot) bool {
 	r.RaftLog.Restore(s)
 	r.Prs = make(map[uint64]*Progress)
 	for _, n := range s.Metadata.ConfState.Nodes {
-		match, next := uint64(0), r.RaftLog.LastIndex()+1
-		if n == r.id {
-			match = next - 1
-		}
-		r.Prs[n] = &Progress{Match: match, Next: next}
+		r.Prs[n] = &Progress{Match: 0, Next: r.RaftLog.LastIndex() + 1}
 	}
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	return true
 }
 
@@ -658,7 +657,6 @@ func (r *Raft) removeNode(id uint64) {
 func tickLeader(r *Raft, m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
-		DPrintf("%v receive beat message: %v", r.id, m)
 		r.broadcastHeartbeat()
 	case pb.MessageType_MsgPropose:
 		DPrintf("%v receive propose message: %v", r.id, m)
@@ -679,7 +677,6 @@ func tickLeader(r *Raft, m pb.Message) {
 		// 给 follower 发送 appendEntries message
 		r.broadcastAppend()
 	case pb.MessageType_MsgHeartbeatResponse:
-		DPrintf("%v receive heartbeat response msg %v", r.id, m)
 		if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
@@ -757,7 +754,6 @@ func tickCandidate(r *Raft, m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHeartbeat:
-		DPrintf("%v receive heartbeat msg: %v", r.id, m)
 		r.becomeFollower(m.Term, m.From)
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgSnapshot:
@@ -775,7 +771,6 @@ func tickFollower(r *Raft, m pb.Message) {
 		r.electionElapsed = 0
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHeartbeat:
-		DPrintf("%v receive heartbeat message: %v", r.id, m)
 		r.Lead = m.From
 		r.electionElapsed = 0
 		r.handleHeartbeat(m)

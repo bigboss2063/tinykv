@@ -315,8 +315,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 			return err
 		}
 	}
-	raftWB.MustWriteToDB(ps.Engines.Raft)
-	raftWB.Reset()
 	return nil
 }
 
@@ -332,7 +330,38 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	if ps.isInitialized() {
+		err := ps.clearMeta(kvWB, raftWB)
+		if err != nil {
+			panic(err)
+		}
+		ps.clearExtraData(ps.region)
+	}
+	applySnapshot := &ApplySnapResult{PrevRegion: ps.region}
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState)
+	if err != nil {
+		panic(err)
+	}
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	err = kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState)
+	if err != nil {
+		panic(err)
+	}
+	kvWB.MustWriteToDB(ps.Engines.Kv)
+	<-ch
+	applySnapshot.Region = snapData.Region
+	return applySnapshot, nil
 }
 
 // Save memory states to disk.
@@ -349,6 +378,10 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		ps.raftState.LastIndex = ready.Entries[len(ready.Entries)-1].Index
 		ps.raftState.LastTerm = ready.Entries[len(ready.Entries)-1].Term
 	}
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		kvWB := new(engine_util.WriteBatch)
+		ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+	}
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
@@ -357,6 +390,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if err != nil {
 		panic(err)
 	}
+
 	return nil, nil
 }
 
