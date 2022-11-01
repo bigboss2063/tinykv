@@ -99,8 +99,14 @@ func (d *peerMsgHandler) findProposal(entry *pb.Entry) *proposal {
 			d.proposals = d.proposals[1:]
 			break
 		}
+		if prop.term < entry.Term || (prop.term == entry.Term && prop.index < entry.Index) {
+			// 如果 proposal 过期了就返回一个过期的 Err
+			d.proposals = d.proposals[1:]
+			prop.cb.Done(ErrRespStaleCommand(entry.Term))
+			prop = nil
+			continue
+		}
 		d.proposals = d.proposals[1:]
-		prop.cb.Done(ErrRespStaleCommand(entry.Term))
 		prop = nil
 	}
 	return prop
@@ -121,15 +127,17 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 			kvWB.Reset()
 			log.Debugf("%v apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
-			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
-			if err != nil {
-				panic(err)
+			if prop != nil {
+				val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+				if err != nil {
+					panic(err)
+				}
+				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{
+						Value: val,
+					},
+				})
 			}
-			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-				CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{
-					Value: val,
-				},
-			})
 		case raft_cmdpb.CmdType_Snap:
 			log.Debugf("%v prepare to apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
 			d.peerStorage.applyState.AppliedIndex = entry.Index
@@ -140,21 +148,27 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 			kvWB.Reset()
 			log.Debugf("%v apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
-			txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-				CmdType: raft_cmdpb.CmdType_Snap,
-				Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
-			})
+			if prop != nil {
+				txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				})
+			}
 		case raft_cmdpb.CmdType_Put:
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-				CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
-			})
+			if prop != nil {
+				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
+				})
+			}
 		case raft_cmdpb.CmdType_Delete:
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-			raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
-				CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
-			})
+			if prop != nil {
+				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{},
+				})
+			}
 		default:
 			panic("err type of cmd!")
 		}
@@ -256,6 +270,14 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	// 如果不是 leader 就不需要 propose 了，并把当前节点已知的 leader 发送给 client
+	if !d.IsLeader() {
+		cb.Done(ErrResp(&util.ErrNotLeader{
+			RegionId: d.regionId,
+			Leader:   d.getPeerFromCache(d.LeaderId()),
+		}))
+		return
+	}
 	data, err := msg.Marshal()
 	if err != nil {
 		panic(err)
