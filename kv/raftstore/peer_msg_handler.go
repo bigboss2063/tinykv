@@ -65,14 +65,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		log.Debugf("%v has committed entries len %v", d.ctx.store.Id, len(ready.CommittedEntries))
 		kvWB := new(engine_util.WriteBatch)
 		for _, entry := range ready.CommittedEntries {
-			raftReq := &raft_cmdpb.RaftCmdRequest{}
-			_ = raftReq.Unmarshal(entry.Data)
-			if len(raftReq.Requests) > 0 {
-				raftResp := newCmdResp()
-				prop := d.findProposal(&entry)
-				d.handleNormalRequest(raftReq, raftResp, kvWB, entry, prop)
-			} else if raftReq.AdminRequest != nil {
-				d.handleAdminRequest(raftReq, kvWB, entry)
+			if entry.EntryType == pb.EntryType_EntryConfChange {
+				cc := &pb.ConfChange{}
+				_ = cc.Unmarshal(entry.Data)
+				// TODO(bigboss) handle conf change
+			} else {
+				raftReq := &raft_cmdpb.RaftCmdRequest{}
+				_ = raftReq.Unmarshal(entry.Data)
+				if len(raftReq.Requests) > 0 {
+					prop := d.findProposal(&entry)
+					raftResp := newCmdResp()
+					d.handleNormalRequest(raftReq, raftResp, kvWB, entry, prop)
+				} else if raftReq.AdminRequest != nil {
+					d.handleAdminRequest(raftReq, kvWB)
+				}
 			}
 		}
 		log.Debugf("%v prepare to write applyState to disk", d.ctx.store.Id)
@@ -180,7 +186,7 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 	}
 }
 
-func (d *peerMsgHandler) handleAdminRequest(raftReq *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch, entry pb.Entry) {
+func (d *peerMsgHandler) handleAdminRequest(raftReq *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) {
 	log.Debugf("%v begin handle admin request %v", d.ctx.store.Id, raftReq.AdminRequest)
 	switch raftReq.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
@@ -278,20 +284,41 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		}))
 		return
 	}
-	data, err := msg.Marshal()
-	if err != nil {
-		panic(err)
-	}
 	prop := &proposal{
 		index: d.nextProposalIndex(),
 		term:  d.Term(),
 		cb:    cb,
 	}
-	err = d.RaftGroup.Propose(data)
+	// leader transfer 不需要进行日志复制，直接调用 RawNode.TransferLeader 即可
+	if msg.AdminRequest != nil {
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			log.Debugf("%v receive a transfer leader cmd", d.ctx.store.Id)
+			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+			raftResp := newCmdResp()
+			raftResp.AdminResponse = &raft_cmdpb.AdminResponse{
+				CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+			}
+			cb.Done(raftResp)
+			return
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			err := d.RaftGroup.ProposeConfChange(pb.ConfChange{
+				ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
+				NodeId:     msg.AdminRequest.ChangePeer.Peer.StoreId,
+			})
+			if err != nil {
+				panic(err)
+			}
+			d.proposals = append(d.proposals, prop)
+			return
+		}
+	}
+	data, err := msg.Marshal()
 	if err != nil {
-		// TODO(bigboss) handle err
 		panic(err)
 	}
+	_ = d.RaftGroup.Propose(data)
 	d.proposals = append(d.proposals, prop)
 }
 
