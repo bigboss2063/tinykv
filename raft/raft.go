@@ -198,11 +198,15 @@ func newRaft(c *Config) *Raft {
 		}
 		peers = confState.Nodes
 	}
+	raftLog := newLog(c.Storage)
+	entries, _ := raftLog.Entries(c.Applied+1, raftLog.LastIndex()+1)
+	// 找出已经持久化但还没有 apply 的 Conf Change
+	pendingConfChange := indexOfPendingConf(entries)
 	raft := &Raft{
 		id:               c.ID,
 		Term:             None,
 		Vote:             None,
-		RaftLog:          newLog(c.Storage),
+		RaftLog:          raftLog,
 		Prs:              make(map[uint64]*Progress),
 		State:            StateFollower,
 		votes:            make(map[uint64]bool),
@@ -212,7 +216,7 @@ func newRaft(c *Config) *Raft {
 		heartbeatElapsed: 0,
 		electionElapsed:  0,
 		leadTransferee:   None,
-		PendingConfIndex: None,
+		PendingConfIndex: pendingConfChange,
 	}
 	for _, p := range peers {
 		raft.Prs[p] = &Progress{Match: 0, Next: 1}
@@ -450,7 +454,7 @@ func (r *Raft) becomeLeader() {
 	if err != nil {
 		log.Panicf("unexpected error getting uncommitted entries (%v)", err)
 	}
-	pendingConfIndex := numOfPendingConf(ents)
+	pendingConfIndex := indexOfPendingConf(ents)
 	if pendingConfIndex != None {
 		r.PendingConfIndex = pendingConfIndex
 	}
@@ -512,7 +516,7 @@ func (r *Raft) Step(m pb.Message) error {
 		if err != nil {
 			log.Panicf("unexpected error getting unapplied entries (%v)", err)
 		}
-		if index := numOfPendingConf(ents); index != 0 && r.RaftLog.committed > r.RaftLog.applied {
+		if index := indexOfPendingConf(ents); index != 0 && r.RaftLog.committed > r.RaftLog.applied {
 			DPrintf("%v can't begin a election, because there is a conf change entry wait to apply ,index %v", r.id, index)
 			return nil
 		}
@@ -747,6 +751,12 @@ func tickLeader(r *Raft, m pb.Message) {
 		if r.leadTransferee != None {
 			DPrintf("%v leadTransferee is not None %v, stopping propose logs", r.id, r.leadTransferee)
 		}
+		// 先设置日志的 Index 再设置 PendingConfIndex
+		li := r.RaftLog.LastIndex()
+		for i := range m.Entries {
+			m.Entries[i].Index = li + 1 + uint64(i)
+			m.Entries[i].Term = r.Term
+		}
 		for i, e := range m.Entries {
 			if e.EntryType == pb.EntryType_EntryConfChange {
 				// 如果还有未 apply 的 conf change，就无视新的 conf change
@@ -756,11 +766,6 @@ func tickLeader(r *Raft, m pb.Message) {
 				}
 				r.PendingConfIndex = m.Entries[i].Index
 			}
-		}
-		li := r.RaftLog.LastIndex()
-		for i := range m.Entries {
-			m.Entries[i].Index = li + 1 + uint64(i)
-			m.Entries[i].Term = r.Term
 		}
 		li = r.RaftLog.append(m.Entries...)
 		r.Prs[r.id].Match = li
@@ -922,11 +927,12 @@ func tickFollower(r *Raft, m pb.Message) {
 	}
 }
 
-func numOfPendingConf(ents []*pb.Entry) uint64 {
+func indexOfPendingConf(ents []*pb.Entry) uint64 {
 	pendingConfIndex := None
 	for i := range ents {
 		if ents[i].EntryType == pb.EntryType_EntryConfChange {
 			pendingConfIndex = ents[i].Index
+			break
 		}
 	}
 	return pendingConfIndex
