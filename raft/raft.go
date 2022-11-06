@@ -199,8 +199,8 @@ func newRaft(c *Config) *Raft {
 		peers = confState.Nodes
 	}
 	raftLog := newLog(c.Storage)
-	entries, _ := raftLog.Entries(c.Applied+1, raftLog.LastIndex()+1)
-	// 找出已经持久化但还没有 apply 的 Conf Change
+	entries, _ := raftLog.Entries(c.Applied+1, raftLog.committed+1)
+	// 找出已经 committed 但还没有 apply 的 Conf Change
 	pendingConfChange := indexOfPendingConf(entries)
 	raft := &Raft{
 		id:               c.ID,

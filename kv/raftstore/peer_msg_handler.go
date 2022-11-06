@@ -44,17 +44,17 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
-	log.Debugf("%v begin handle a raft ready", d.ctx.store.Id)
+	log.Debugf("%v begin handle a raft ready", d.Tag)
 	defer func() {
-		log.Debugf("%v end handle a raft ready", d.ctx.store.Id)
+		log.Debugf("%v end handle a raft ready", d.Tag)
 	}()
 	if d.stopped {
-		log.Debugf("%v already stopped", d.ctx.store.Id)
+		log.Debugf("%v already stopped", d.Tag)
 		return
 	}
 	// Your Code Here (2B).
 	if !d.RaftGroup.HasReady() {
-		log.Debugf("%v there is no ready", d.ctx.store.Id)
+		log.Debugf("%v there is no ready", d.Tag)
 		return
 	}
 	ready := d.RaftGroup.Ready()
@@ -62,17 +62,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if applySnapResult.Region != nil {
 		// 更新 storeMeta 中的 region 信息
 		d.ctx.storeMeta.Lock()
-		d.ctx.storeMeta.regions[d.regionId] = applySnapResult.Region
+		d.ctx.storeMeta.setRegion(applySnapResult.Region, d.peer)
 		d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapResult.PrevRegion})
 		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapResult.Region})
 		d.ctx.storeMeta.Unlock()
 	}
 	d.Send(d.ctx.trans, ready.Messages)
 	if len(ready.CommittedEntries) > 0 {
-		log.Debugf("%v has committed entries len %v", d.ctx.store.Id, len(ready.CommittedEntries))
+		log.Debugf("%v has committed entries len %v", d.Tag, len(ready.CommittedEntries))
 		kvWB := new(engine_util.WriteBatch)
 		for _, entry := range ready.CommittedEntries {
-			prop := d.findProposal(&entry)
 			if entry.EntryType == pb.EntryType_EntryConfChange {
 				if d.handleConfChange(&entry, kvWB) {
 					// 如果当前节点被 destroy 了就直接返回
@@ -81,6 +80,14 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			} else {
 				raftReq := &raft_cmdpb.RaftCmdRequest{}
 				_ = raftReq.Unmarshal(entry.Data)
+				prop := d.findProposal(&entry)
+				err := util.CheckRegionEpoch(raftReq, d.Region(), true)
+				if err != nil {
+					if prop != nil {
+						prop.cb.Done(ErrResp(err))
+					}
+					continue
+				}
 				if len(raftReq.Requests) > 0 {
 					raftResp := newCmdResp()
 					d.handleNormalRequest(raftReq, raftResp, kvWB, entry, prop)
@@ -89,18 +96,15 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				}
 			}
 		}
-		log.Debugf("%v prepare to write applyState to disk", d.ctx.store.Id)
 		d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
 		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		if err != nil {
 			panic(err)
 		}
 		kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-		log.Debugf("%v write applyState to disk", d.ctx.store.Id)
+		log.Debugf("%v write applyState to disk", d.Tag)
 	}
-	log.Debugf("%v prepare to advance", d.ctx.store.Id)
 	d.RaftGroup.Advance(ready)
-	log.Debugf("%v advance", d.ctx.store.Id)
 }
 
 func (d *peerMsgHandler) findProposal(entry *pb.Entry) *proposal {
@@ -109,7 +113,7 @@ func (d *peerMsgHandler) findProposal(entry *pb.Entry) *proposal {
 		prop = d.proposals[0]
 		if prop.index == entry.Index && prop.term == entry.Term {
 			// 找到对应的 proposal 用于回复 callback
-			log.Debugf("%v find proposal for index %v", d.ctx.store.Id, entry.Index)
+			log.Debugf("%v find proposal for index %v", d.Tag, entry.Index)
 			d.proposals = d.proposals[1:]
 			break
 		}
@@ -126,20 +130,20 @@ func (d *peerMsgHandler) findProposal(entry *pb.Entry) *proposal {
 	return prop
 }
 
-func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest, raftResp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch, entry pb.Entry, prop *proposal) {
+func (d *peerMsgHandler) handleNormalRequest(request *raft_cmdpb.RaftCmdRequest, raftResp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch, entry pb.Entry, prop *proposal) {
 	// Normal Request
-	var txn *badger.Txn
-	// 日志提交的过程中可能 region 信息改变了
-	err := d.checkKeyInRegion(raftReq.Requests)
+	err := d.checkKeyInRegion(request)
 	if err != nil {
-		// 如果 key 不在 region 中了，直接返回
-		prop.cb.Done(ErrResp(err))
+		if prop != nil {
+			prop.cb.Done(ErrResp(err))
+		}
 		return
 	}
-	for _, req := range raftReq.Requests {
+	var txn *badger.Txn
+	for _, req := range request.Requests {
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
-			log.Debugf("%v prepare to apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
+			log.Debugf("%v prepare to apply a Get cmd index %v", d.Tag, entry.Index)
 			d.peerStorage.applyState.AppliedIndex = entry.Index
 			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			if err != nil {
@@ -147,7 +151,7 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 			}
 			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 			kvWB.Reset()
-			log.Debugf("%v apply a Get cmd index %v", d.ctx.store.Id, entry.Index)
+			log.Debugf("%v apply a Get cmd index %v", d.Tag, entry.Index)
 			if prop != nil {
 				val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
 				if err != nil {
@@ -160,7 +164,6 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 				})
 			}
 		case raft_cmdpb.CmdType_Snap:
-			log.Debugf("%v prepare to apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
 			d.peerStorage.applyState.AppliedIndex = entry.Index
 			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			if err != nil {
@@ -168,16 +171,19 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 			}
 			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 			kvWB.Reset()
-			log.Debugf("%v apply a Snap cmd index %v", d.ctx.store.Id, entry.Index)
 			if prop != nil {
 				txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				// 一定不能直接把引用传过去，否则传过去之后如果当前 region 的 key range 被修改的话就会出现错误！
+				cloneRegion := metapb.Region{}
+				_ = util.CloneMsg(d.Region(), &cloneRegion)
 				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Snap,
-					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+					Snap:    &raft_cmdpb.SnapResponse{Region: &cloneRegion},
 				})
 			}
 		case raft_cmdpb.CmdType_Put:
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+			log.Debugf("%v put key %v to region", d.Tag, req.Put.Key)
 			if prop != nil {
 				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
@@ -197,23 +203,56 @@ func (d *peerMsgHandler) handleNormalRequest(raftReq *raft_cmdpb.RaftCmdRequest,
 	if prop != nil {
 		prop.cb.Txn = txn
 		prop.cb.Done(raftResp)
-		log.Debugf("%v finish to handle raft cmd", d.ctx.store.Id)
+		log.Debugf("%v finish to handle raft cmd", d.Tag)
 	}
 }
 
-func (d *peerMsgHandler) handleAdminRequest(raftReq *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) {
-	switch raftReq.AdminRequest.CmdType {
+func (d *peerMsgHandler) handleAdminRequest(request *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) {
+	switch request.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
-		log.Debugf("%v receive a compact log cmd", d.ctx.store.Id)
-		d.peerStorage.applyState.TruncatedState.Index = raftReq.AdminRequest.CompactLog.CompactIndex
-		d.peerStorage.applyState.TruncatedState.Term = raftReq.AdminRequest.CompactLog.CompactTerm
+		log.Debugf("%v receive a compact log cmd", d.Tag)
+		d.peerStorage.applyState.TruncatedState.Index = request.AdminRequest.CompactLog.CompactIndex
+		d.peerStorage.applyState.TruncatedState.Term = request.AdminRequest.CompactLog.CompactTerm
 		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		if err != nil {
 			panic(err)
 		}
-		kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-		kvWB.Reset()
-		d.ScheduleCompactLog(raftReq.AdminRequest.CompactLog.CompactIndex)
+		d.ScheduleCompactLog(request.AdminRequest.CompactLog.CompactIndex)
+	case raft_cmdpb.AdminCmdType_Split:
+		log.Debugf("%v receive a split cmd", d.Tag)
+		d.ctx.storeMeta.Lock()
+		leftRegion := d.Region()
+		if engine_util.ExceedEndKey(request.AdminRequest.Split.SplitKey, leftRegion.EndKey) {
+			return
+		}
+		rightRegion := &metapb.Region{}
+		err := util.CloneMsg(leftRegion, rightRegion)
+		if err != nil {
+			panic(err)
+		}
+		leftRegion.RegionEpoch.Version++
+		rightRegion.RegionEpoch.Version++
+		rightRegion.Id = request.AdminRequest.Split.NewRegionId
+		rightRegion.StartKey = request.AdminRequest.Split.SplitKey
+		rightRegion.EndKey = leftRegion.EndKey
+		leftRegion.EndKey = request.AdminRequest.Split.SplitKey
+		for i, id := range request.AdminRequest.Split.NewPeerIds {
+			rightRegion.Peers[i].Id = id
+		}
+		peer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, rightRegion)
+		// 参考 maybeCreatePeer 会将 peer 注册进 router 后要发送一条 MsgTypeStart 来启动 peer
+		d.ctx.router.register(peer)
+		_ = d.ctx.router.send(rightRegion.Id, message.Msg{Type: message.MsgTypeStart})
+		if err != nil {
+			panic(err)
+		}
+		d.ctx.storeMeta.setRegion(leftRegion, d.peer)
+		d.ctx.storeMeta.setRegion(rightRegion, peer)
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: leftRegion})
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: rightRegion})
+		d.ctx.storeMeta.Unlock()
+		meta.WriteRegionState(kvWB, leftRegion, rspb.PeerState_Normal)
+		meta.WriteRegionState(kvWB, rightRegion, rspb.PeerState_Normal)
 	}
 }
 
@@ -231,6 +270,7 @@ func (d *peerMsgHandler) handleConfChange(entry *pb.Entry, kvWB *engine_util.Wri
 			StoreId: uint64(storeId),
 		}
 		region.Peers = append(region.Peers, peer)
+		d.ctx.storeMeta.setRegion(region, d.peer)
 		meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
 		d.insertPeerCache(peer)
 		d.ctx.storeMeta.Unlock()
@@ -244,17 +284,11 @@ func (d *peerMsgHandler) handleConfChange(entry *pb.Entry, kvWB *engine_util.Wri
 		region.RegionEpoch.ConfVer++
 		for i, p := range region.Peers {
 			if p.Id == cc.NodeId {
-				switch i {
-				case 0:
-					region.Peers = region.Peers[1:]
-				case len(region.Peers) - 1:
-					region.Peers = region.Peers[:len(region.Peers)-1]
-				default:
-					region.Peers = append(region.Peers[:i], region.Peers[i+1:]...)
-				}
+				region.Peers = append(region.Peers[:i], region.Peers[i+1:]...)
 				break
 			}
 		}
+		d.ctx.storeMeta.setRegion(region, d.peer)
 		meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
 		d.removePeerCache(cc.NodeId)
 		d.ctx.storeMeta.Unlock()
@@ -264,9 +298,9 @@ func (d *peerMsgHandler) handleConfChange(entry *pb.Entry, kvWB *engine_util.Wri
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
-	log.Debugf("%v begin handle a msg", d.ctx.store.Id)
+	log.Debugf("%v begin handle a msg", d.Tag)
 	defer func() {
-		log.Debugf("%v end handle a msg", d.ctx.store.Id)
+		log.Debugf("%v end handle a msg", d.Tag)
 	}()
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
@@ -336,25 +370,16 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-	// 如果不是 leader 就不需要 propose 了，并把当前节点已知的 leader 发送给 client
-	if !d.IsLeader() {
-		cb.Done(ErrResp(&util.ErrNotLeader{
-			RegionId: d.regionId,
-			Leader:   d.getPeerFromCache(d.LeaderId()),
-		}))
-		return
-	}
-	// key 不在 region 中，直接返回
-	err = d.checkKeyInRegion(msg.Requests)
-	if err != nil {
-		cb.Done(ErrResp(err))
+	// 如果不存在该 region，直接返回
+	if _, ok := d.ctx.storeMeta.regions[msg.Header.RegionId]; !ok {
+		cb.Done(ErrRespRegionNotFound(msg.Header.RegionId))
 		return
 	}
 	if msg.AdminRequest != nil {
 		switch msg.AdminRequest.CmdType {
 		case raft_cmdpb.AdminCmdType_TransferLeader:
 			// leader transfer 不需要进行日志复制，直接调用 RawNode.TransferLeader 即可
-			log.Debugf("%v receive a transfer leader cmd", d.ctx.store.Id)
+			log.Debugf("%v receive a transfer leader cmd", d.Tag)
 			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
 			raftResp := newCmdResp()
 			raftResp.AdminResponse = &raft_cmdpb.AdminResponse{
@@ -364,6 +389,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			cb.Done(raftResp)
 			return
 		case raft_cmdpb.AdminCmdType_ChangePeer:
+			// 当只剩下两个节点的时候，如果移除 leader，那么在 Unreliable 的情况下可能发生 request timeout
+			// 假设现在只有 leader A，follower B 两个节点，A 收到了 remove A 的指令，先对 B 进行同步，收到 resp 后 commit 这条 remove 指令
+			// 这时再去同步 B 的 commitIndex，但如果 A apply 了这条 remove 指令，但用于同步 B 的 commitIndex 的 rpc 丢掉了的话
+			// 就会造成 A 已经把自己 destroy 了，但是 B 没有将 A remove，这时候它来发起选举就永远选不出 leader 了
+			// 碰到这种情况就直接把这次 Conf Change 拒绝，并且将 leader 转移为 另一个节点
+			if msg.AdminRequest.ChangePeer.ChangeType == pb.ConfChangeType_RemoveNode &&
+				len(d.Region().Peers) == 2 && d.IsLeader() {
+				log.Debugf("%v there is only two nodes, can't remove a leader!", d.Tag)
+				for _, peer := range d.Region().Peers {
+					if peer.Id != d.PeerId() && peer.StoreId == d.storeID() {
+						d.RaftGroup.TransferLeader(peer.Id)
+						log.Debugf("%v transfer leader to %v", d.Tag, peer.Id)
+						break
+					}
+				}
+				return
+			}
 			// 根据 PendingConfIndex 上的注释，只有 applyIndex > PendingConfIndex 才能提交 Conf Change
 			if d.RaftGroup.Raft.PendingConfIndex < d.peerStorage.AppliedIndex() {
 				err := d.RaftGroup.ProposeConfChange(pb.ConfChange{
@@ -376,9 +418,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				}
 			}
 			return
+		case raft_cmdpb.AdminCmdType_Split:
+			if engine_util.ExceedEndKey(msg.AdminRequest.Split.SplitKey, d.Region().EndKey) {
+				return
+			}
 		}
 	}
-	// LogCompact 也是走的这边 Propose
+	// key 不在 region 中，直接返回 ErrKeyNotInRegion
+	err = d.checkKeyInRegion(msg)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	// LogCompact Split 也是走的这边 Propose
 	prop := &proposal{
 		index: d.nextProposalIndex(),
 		term:  d.Term(),
@@ -392,8 +444,8 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	d.proposals = append(d.proposals, prop)
 }
 
-func (d *peerMsgHandler) checkKeyInRegion(requests []*raft_cmdpb.Request) error {
-	for _, req := range requests {
+func (d *peerMsgHandler) checkKeyInRegion(request *raft_cmdpb.RaftCmdRequest) error {
+	for _, req := range request.Requests {
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
 			return util.CheckKeyInRegion(req.Get.Key, d.Region())

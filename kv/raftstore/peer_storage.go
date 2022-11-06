@@ -3,7 +3,6 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -350,18 +349,20 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.snapState.StateType = snap.SnapState_Applying
 	applySnapshotResult := &ApplySnapResult{PrevRegion: ps.region}
 	// 如果有新的 Region 信息，则更新 RegionLocalState
-	if snapData.Region != nil && !reflect.DeepEqual(snapData.Region, ps.region) {
-		ps.region = snapData.Region
-		meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
-		applySnapshotResult.Region = snapData.Region
+	if !util.RegionEqual(snapData.Region, ps.region) && !util.IsEpochStale(snapData.Region.RegionEpoch, ps.region.RegionEpoch) {
+		cloneRegion := &metapb.Region{}
+		_ = util.CloneMsg(snapData.Region, cloneRegion)
+		ps.region = cloneRegion
+		meta.WriteRegionState(kvWB, cloneRegion, rspb.PeerState_Normal)
+		applySnapshotResult.Region = cloneRegion
 	}
 	ch := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: ps.region.GetId(),
 		Notifier: ch,
 		SnapMeta: snapshot.Metadata,
-		StartKey: snapData.Region.GetStartKey(),
-		EndKey:   snapData.Region.GetEndKey(),
+		StartKey: ps.region.GetStartKey(),
+		EndKey:   ps.region.GetEndKey(),
 	}
 	ps.raftState.LastIndex = snapshot.Metadata.Index
 	ps.raftState.LastTerm = snapshot.Metadata.Term

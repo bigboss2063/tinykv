@@ -3,6 +3,8 @@ package util
 import (
 	"bytes"
 	"fmt"
+	"github.com/Connor1996/badger"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
@@ -204,4 +206,21 @@ func RegionEqual(l, r *metapb.Region) bool {
 		return false
 	}
 	return l.Id == r.Id && l.RegionEpoch.Version == r.RegionEpoch.Version && l.RegionEpoch.ConfVer == r.RegionEpoch.ConfVer
+}
+
+func StringRegionKeys(kv *badger.DB, startKey []byte, endKey []byte, regionId uint64) {
+	txn := kv.NewTransaction(false)
+	defer txn.Discard()
+	it := engine_util.NewCFIterator(engine_util.CfDefault, txn)
+	defer it.Close()
+	fmt.Printf("keys in region %v: [", regionId)
+	for it.Seek(startKey); it.Valid(); it.Next() {
+		item := it.Item()
+		key := item.Key()
+		if engine_util.ExceedEndKey(key, endKey) {
+			break
+		}
+		fmt.Printf("%v ", key)
+	}
+	fmt.Printf("] \n")
 }
