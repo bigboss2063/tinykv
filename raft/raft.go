@@ -199,9 +199,6 @@ func newRaft(c *Config) *Raft {
 		peers = confState.Nodes
 	}
 	raftLog := newLog(c.Storage)
-	entries, _ := raftLog.Entries(c.Applied+1, raftLog.committed+1)
-	// 找出已经 committed 但还没有 apply 的 Conf Change
-	pendingConfChange := indexOfPendingConf(entries)
 	raft := &Raft{
 		id:               c.ID,
 		Term:             None,
@@ -216,7 +213,6 @@ func newRaft(c *Config) *Raft {
 		heartbeatElapsed: 0,
 		electionElapsed:  0,
 		leadTransferee:   None,
-		PendingConfIndex: pendingConfChange,
 	}
 	for _, p := range peers {
 		raft.Prs[p] = &Progress{Match: 0, Next: 1}
@@ -227,7 +223,11 @@ func newRaft(c *Config) *Raft {
 		raft.RaftLog.committed = hardState.Commit
 	}
 	raft.RaftLog.applyTo(c.Applied)
+	entries, _ := raftLog.Entries(raftLog.applied+1, raftLog.committed+1)
+	// 找出已经 committed 但还没有 apply 的 Conf Change
+	pendingConfChange := indexOfPendingConf(entries)
 	raft.resetRandomizedElectionTimeout()
+	raft.PendingConfIndex = pendingConfChange
 	return raft
 }
 
