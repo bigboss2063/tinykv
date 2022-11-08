@@ -222,8 +222,13 @@ func newRaft(c *Config) *Raft {
 		raft.Vote = hardState.Vote
 		raft.RaftLog.committed = hardState.Commit
 	}
-	raft.RaftLog.applyTo(c.Applied)
-	entries, _ := raftLog.Entries(raftLog.applied+1, raftLog.committed+1)
+	if c.Applied > 0 {
+		raftLog.applyTo(c.Applied)
+	}
+	entries := make([]*pb.Entry, 0)
+	for _, e := range raftLog.nextEnts() {
+		entries = append(entries, &e)
+	}
 	// 找出已经 committed 但还没有 apply 的 Conf Change
 	pendingConfChange := indexOfPendingConf(entries)
 	raft.resetRandomizedElectionTimeout()

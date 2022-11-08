@@ -349,7 +349,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.snapState.StateType = snap.SnapState_Applying
 	applySnapshotResult := &ApplySnapResult{PrevRegion: ps.region}
 	// 如果有新的 Region 信息，则更新 RegionLocalState
-	if !util.RegionEqual(snapData.Region, ps.region) && !util.IsEpochStale(snapData.Region.RegionEpoch, ps.region.RegionEpoch) {
+	if !util.IsEpochStale(snapData.Region.RegionEpoch, ps.region.RegionEpoch) {
 		cloneRegion := &metapb.Region{}
 		_ = util.CloneMsg(snapData.Region, cloneRegion)
 		ps.region = cloneRegion
