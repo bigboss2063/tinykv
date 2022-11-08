@@ -183,13 +183,18 @@ func (d *peerMsgHandler) handleNormalRequest(request *raft_cmdpb.RaftCmdRequest,
 			}
 		case raft_cmdpb.CmdType_Put:
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-			log.Debugf("%v put key %v to region", d.Tag, req.Put.Key)
+			// 更新 SizeDiffHint，当发现 SizeDiffHint 不超过分裂尺寸的八分之一时就不发送 SplitCheckTask 检查是否进行分裂
+			// 这样可以使得扫描数据库来获取当前 ApproximateSize 的次数减少，提高性能
+			d.SizeDiffHint += uint64(len(req.Put.Key) + len(req.Put.Value))
 			if prop != nil {
 				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{},
 				})
 			}
 		case raft_cmdpb.CmdType_Delete:
+			val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Delete.Cf, req.Delete.Key)
+			// 同 Put 操作
+			d.SizeDiffHint -= uint64(len(req.Delete.Key) + len(val))
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
 			if prop != nil {
 				raftResp.Responses = append(raftResp.Responses, &raft_cmdpb.Response{
@@ -404,7 +409,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 						break
 					}
 				}
-				return
+				//return
 			}
 			// 根据 PendingConfIndex 上的注释，只有 applyIndex > PendingConfIndex 才能提交 Conf Change
 			if d.RaftGroup.Raft.PendingConfIndex < d.peerStorage.AppliedIndex() {
