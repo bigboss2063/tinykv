@@ -72,15 +72,15 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		log.Debugf("%v has committed entries len %v", d.Tag, len(ready.CommittedEntries))
 		kvWB := new(engine_util.WriteBatch)
 		for _, entry := range ready.CommittedEntries {
+			prop := d.findProposal(&entry)
 			if entry.EntryType == pb.EntryType_EntryConfChange {
-				if d.handleConfChange(&entry, kvWB) {
+				if d.handleConfChange(&entry, kvWB, prop) {
 					// 如果当前节点被 destroy 了就直接返回
 					return
 				}
 			} else {
 				raftReq := &raft_cmdpb.RaftCmdRequest{}
 				_ = raftReq.Unmarshal(entry.Data)
-				prop := d.findProposal(&entry)
 				err := util.CheckRegionEpoch(raftReq, d.Region(), true)
 				if err != nil {
 					if prop != nil {
@@ -261,7 +261,7 @@ func (d *peerMsgHandler) handleAdminRequest(request *raft_cmdpb.RaftCmdRequest, 
 	}
 }
 
-func (d *peerMsgHandler) handleConfChange(entry *pb.Entry, kvWB *engine_util.WriteBatch) bool {
+func (d *peerMsgHandler) handleConfChange(entry *pb.Entry, kvWB *engine_util.WriteBatch, prop *proposal) bool {
 	cc := &pb.ConfChange{}
 	_ = cc.Unmarshal(entry.Data)
 	switch cc.ChangeType {
@@ -299,6 +299,13 @@ func (d *peerMsgHandler) handleConfChange(entry *pb.Entry, kvWB *engine_util.Wri
 		d.ctx.storeMeta.Unlock()
 	}
 	d.RaftGroup.ApplyConfChange(*cc)
+	if prop != nil {
+		raftCmdResp := newCmdResp()
+		cloneRegion := &metapb.Region{}
+		_ = util.CloneMsg(d.Region(), cloneRegion)
+		raftCmdResp.AdminResponse = &raft_cmdpb.AdminResponse{CmdType: raft_cmdpb.AdminCmdType_ChangePeer, ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: cloneRegion}}
+		prop.cb.Done(raftCmdResp)
+	}
 	return false
 }
 
@@ -380,6 +387,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrRespRegionNotFound(msg.Header.RegionId))
 		return
 	}
+	prop := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
 	if msg.AdminRequest != nil {
 		switch msg.AdminRequest.CmdType {
 		case raft_cmdpb.AdminCmdType_TransferLeader:
@@ -400,18 +412,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			// 就会造成 A 已经把自己 destroy 了，但是 B 没有将 A remove，这时候它来发起选举就永远选不出 leader 了
 			// 碰到这种情况就直接把这次 Conf Change 拒绝，并且将 leader 转移为 另一个节点
 			if msg.AdminRequest.ChangePeer.ChangeType == pb.ConfChangeType_RemoveNode &&
-				len(d.Region().Peers) == 2 && d.IsLeader() {
-				log.Debugf("%v there is only two nodes, can't remove a leader!", d.Tag)
+				len(d.Region().Peers) == 2 && d.IsLeader() && msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+				log.Debugf("%v there is only two nodes, can't remove a leader", d.Tag)
 				for _, peer := range d.Region().Peers {
-					if peer.Id != d.PeerId() && peer.StoreId == d.storeID() {
+					if peer.Id != d.PeerId() {
 						d.RaftGroup.TransferLeader(peer.Id)
 						log.Debugf("%v transfer leader to %v", d.Tag, peer.Id)
-						break
+						// 发现 ChangePeer 命令是有 callback 的，需要及时回复，否则很容易超时
+						cb.Done(ErrResp(fmt.Errorf("%v there is only two nodes, can't remove a leader", d.Tag)))
+						return
 					}
 				}
-				//return
 			}
-			// 根据 PendingConfIndex 上的注释，只有 applyIndex > PendingConfIndex 才能提交 Conf Change
+			// 根据 PendingConfIndex 上的注释，只有 applyIndex > PendingConfIndex 才能 propose Conf Change
 			if d.RaftGroup.Raft.PendingConfIndex < d.peerStorage.AppliedIndex() {
 				err := d.RaftGroup.ProposeConfChange(pb.ConfChange{
 					ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
@@ -421,6 +434,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				if err != nil {
 					panic(err)
 				}
+				d.proposals = append(d.proposals, prop)
 			}
 			return
 		case raft_cmdpb.AdminCmdType_Split:
@@ -434,12 +448,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
-	}
-	// LogCompact Split 也是走的这边 Propose
-	prop := &proposal{
-		index: d.nextProposalIndex(),
-		term:  d.Term(),
-		cb:    cb,
 	}
 	data, err := msg.Marshal()
 	if err != nil {

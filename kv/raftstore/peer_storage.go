@@ -370,6 +370,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if err != nil {
 		panic(err)
 	}
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
 	err = kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
