@@ -125,6 +125,8 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next uint64
+	// RecentActive 用于记录这个节点是否还活跃
+	RecentActive bool
 }
 
 type Raft struct {
@@ -225,14 +227,7 @@ func newRaft(c *Config) *Raft {
 	if c.Applied > 0 {
 		raftLog.applyTo(c.Applied)
 	}
-	entries := make([]*pb.Entry, 0)
-	for _, e := range raftLog.nextEnts() {
-		entries = append(entries, &e)
-	}
-	// 找出已经 committed 但还没有 apply 的 Conf Change
-	pendingConfChange := indexOfPendingConf(entries)
 	raft.resetRandomizedElectionTimeout()
-	raft.PendingConfIndex = pendingConfChange
 	return raft
 }
 
@@ -312,6 +307,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	pr, ok := r.Prs[to]
 	if !ok {
+		return false
+	}
+	// 不活跃的节点就不再发送了
+	if !pr.RecentActive {
+		DPrintf("%v ignore a inactive follower %v", r.id, to)
 		return false
 	}
 	li := r.RaftLog.LastIndex()
@@ -394,6 +394,10 @@ func (r *Raft) heartbeatTicker() {
 
 	if r.electionElapsed >= r.randomizedElectionTimeout {
 		r.electionElapsed = 0
+		// 检查是否有半数以上的节点是活跃的，如果没有就变回 follower
+		if !r.checkQuorumActive() {
+			r.becomeFollower(r.Term, None)
+		}
 		if r.State == StateLeader && r.leadTransferee != None {
 			r.abortLeaderTransfer()
 		}
@@ -455,7 +459,7 @@ func (r *Raft) becomeLeader() {
 		r.Prs[i].Match = 0
 		r.Prs[i].Next = r.RaftLog.LastIndex() + 1
 	}
-	ents, err := r.RaftLog.Entries(r.RaftLog.applied+1, r.RaftLog.committed+1)
+	ents, err := r.RaftLog.Entries(r.RaftLog.committed+1, r.RaftLog.LastIndex()+1)
 	if err != nil {
 		log.Panicf("unexpected error getting uncommitted entries (%v)", err)
 	}
@@ -517,12 +521,17 @@ func (r *Raft) Step(m pb.Message) error {
 			return nil
 		}
 		// 找出还没有应用但已经提交的 conf change
-		ents, err := r.RaftLog.Entries(r.RaftLog.applied+1, r.RaftLog.committed+1)
-		if err != nil {
-			log.Panicf("unexpected error getting unapplied entries (%v)", err)
+		ents := r.RaftLog.nextEnts()
+		pendingConfIndex := None
+		for i := range ents {
+			if ents[i].EntryType == pb.EntryType_EntryConfChange {
+				pendingConfIndex = ents[i].Index
+				break
+			}
 		}
-		if index := indexOfPendingConf(ents); index != 0 && r.RaftLog.committed > r.RaftLog.applied {
-			DPrintf("%v can't begin a election, because there is a conf change entry wait to apply ,index %v", r.id, index)
+		// 存在已经提交但没有应用的 conf change 则不允许发起选举
+		if pendingConfIndex != None && r.RaftLog.committed > r.RaftLog.applied {
+			DPrintf("%v can't begin a election, because there is a conf change entry wait to apply ,index %v", r.id, pendingConfIndex)
 			return nil
 		}
 		r.becomeCandidate()
@@ -752,9 +761,10 @@ func tickLeader(r *Raft, m pb.Message) {
 		if len(m.Entries) == 0 {
 			log.Panicf("%v can't append nil entries", r.id)
 		}
-		// 如果当前正在进行 leadTransfer，就不再接收新的日志
+		// 如果当前正在进行 leadTransfer，就不再接收新的日志，直接返回
 		if r.leadTransferee != None {
 			DPrintf("%v leadTransferee is not None %v, stopping propose logs", r.id, r.leadTransferee)
+			return
 		}
 		// 先设置日志的 Index 再设置 PendingConfIndex
 		li := r.RaftLog.LastIndex()
@@ -781,7 +791,12 @@ func tickLeader(r *Raft, m pb.Message) {
 		// 给 follower 发送 appendEntries message
 		r.broadcastAppend()
 	case pb.MessageType_MsgHeartbeatResponse:
-		if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+		pr, ok := r.Prs[m.From]
+		if !ok {
+			return
+		}
+		pr.RecentActive = true
+		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
 	case pb.MessageType_MsgAppendResponse:
@@ -790,6 +805,7 @@ func tickLeader(r *Raft, m pb.Message) {
 		if !ok {
 			return
 		}
+		pr.RecentActive = true
 		switch m.Reject {
 		case true:
 			// 如果 logTerm 等于 0 表示 follower 在 pervLogIndex 位置没有日志，将 next 设置为 follower 的 lastIndex + 1
@@ -941,4 +957,26 @@ func indexOfPendingConf(ents []*pb.Entry) uint64 {
 		}
 	}
 	return pendingConfIndex
+}
+
+/*
+	检查活跃的节点是否有半数以上
+*/
+func (r *Raft) checkQuorumActive() bool {
+	var act int
+
+	for id := range r.Prs {
+		if id == r.id { // self is always active
+			act++
+			continue
+		}
+
+		if r.Prs[id].RecentActive {
+			act++
+		}
+
+		r.Prs[id].RecentActive = false
+	}
+
+	return act >= len(r.Prs)/2+1
 }

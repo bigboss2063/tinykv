@@ -86,6 +86,8 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	// 我的实现默认是持久化的日志也在 entries 数组里（注释里的示意图是这么画的）
+	// 所以没有实现切掉持久化的日志，留在应用快照之后统一裁掉
 }
 
 func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
@@ -282,6 +284,15 @@ func (l *RaftLog) stableTo(i uint64) {
 func (l *RaftLog) stableSnapTo(i uint64) {
 	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
 		l.pendingSnapshot = nil
+	}
+	// 已经被压缩的日志就切掉，并且要及时更新 dummyIndex
+	if i > l.dummyIndex {
+		if len(l.entries) > 0 {
+			compactedEntries := l.entries[i-l.dummyIndex:]
+			l.entries = make([]pb.Entry, len(compactedEntries))
+			copy(l.entries, compactedEntries)
+		}
+		l.dummyIndex = i
 	}
 }
 
