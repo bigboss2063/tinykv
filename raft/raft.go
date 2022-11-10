@@ -309,11 +309,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if !ok {
 		return false
 	}
-	// 不活跃的节点就不再发送了
-	if !pr.RecentActive {
-		DPrintf("%v ignore a inactive follower %v", r.id, to)
-		return false
-	}
 	li := r.RaftLog.LastIndex()
 	var prevLogIndex uint64
 	if pr.Next-1 > li {
@@ -394,10 +389,6 @@ func (r *Raft) heartbeatTicker() {
 
 	if r.electionElapsed >= r.randomizedElectionTimeout {
 		r.electionElapsed = 0
-		// 检查是否有半数以上的节点是活跃的，如果没有就变回 follower
-		if !r.checkQuorumActive() {
-			r.becomeFollower(r.Term, None)
-		}
 		if r.State == StateLeader && r.leadTransferee != None {
 			r.abortLeaderTransfer()
 		}
@@ -795,7 +786,6 @@ func tickLeader(r *Raft, m pb.Message) {
 		if !ok {
 			return
 		}
-		pr.RecentActive = true
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
@@ -805,7 +795,6 @@ func tickLeader(r *Raft, m pb.Message) {
 		if !ok {
 			return
 		}
-		pr.RecentActive = true
 		switch m.Reject {
 		case true:
 			// 如果 logTerm 等于 0 表示 follower 在 pervLogIndex 位置没有日志，将 next 设置为 follower 的 lastIndex + 1
@@ -957,26 +946,4 @@ func indexOfPendingConf(ents []*pb.Entry) uint64 {
 		}
 	}
 	return pendingConfIndex
-}
-
-/*
-	检查活跃的节点是否有半数以上
-*/
-func (r *Raft) checkQuorumActive() bool {
-	var act int
-
-	for id := range r.Prs {
-		if id == r.id { // self is always active
-			act++
-			continue
-		}
-
-		if r.Prs[id].RecentActive {
-			act++
-		}
-
-		r.Prs[id].RecentActive = false
-	}
-
-	return act >= len(r.Prs)/2+1
 }
