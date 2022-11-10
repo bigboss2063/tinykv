@@ -344,7 +344,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		if err != nil {
 			panic(err)
 		}
-		ps.clearExtraData(ps.region)
+		ps.clearExtraData(snapData.Region)
 	}
 	ps.snapState.StateType = snap.SnapState_Applying
 	applySnapshotResult := &ApplySnapResult{PrevRegion: ps.region}

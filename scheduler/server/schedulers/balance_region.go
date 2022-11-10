@@ -122,7 +122,7 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 			break
 		}
 	}
-	if len(selectRegion.GetPeers()) < cluster.GetMaxReplicas() {
+	if len(selectRegion.GetPeers()) != cluster.GetMaxReplicas() {
 		return nil
 	}
 	if moveFromStore == nil {
