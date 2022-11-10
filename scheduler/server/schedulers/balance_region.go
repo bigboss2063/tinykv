@@ -96,14 +96,15 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 	storeDownTime := cluster.GetMaxStoreDownTime()
 	suitAbleStores := StoreInfos{}
 	for _, storeInfo := range cluster.GetStores() {
-		if storeInfo.DownTime() < storeDownTime {
+		if storeInfo.IsUp() && storeInfo.DownTime() < storeDownTime {
 			suitAbleStores = append(suitAbleStores, storeInfo)
 		}
 	}
 	sort.Sort(sort.Reverse(suitAbleStores))
 	var selectRegion *core.RegionInfo
 	var moveFromStore *core.StoreInfo
-	for _, storeInfo := range suitAbleStores {
+	var moveFromStoreIdx int
+	for i, storeInfo := range suitAbleStores {
 		cluster.GetPendingRegionsWithLock(storeInfo.GetID(), func(rc core.RegionsContainer) {
 			selectRegion = rc.RandomRegion(nil, nil)
 		})
@@ -119,8 +120,12 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 		}
 		if selectRegion != nil {
 			moveFromStore = storeInfo
+			moveFromStoreIdx = i
 			break
 		}
+	}
+	if moveFromStoreIdx == len(suitAbleStores)-1 {
+		return nil
 	}
 	if len(selectRegion.GetPeers()) != cluster.GetMaxReplicas() {
 		return nil
@@ -130,7 +135,7 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 	}
 	var moveToStore *core.StoreInfo
 	storeIds := selectRegion.GetStoreIds()
-	for i := len(suitAbleStores) - 1; i >= 0; i-- {
+	for i := len(suitAbleStores) - 1; i > moveFromStoreIdx; i-- {
 		if _, ok := storeIds[suitAbleStores[i].GetID()]; ok {
 			continue
 		}

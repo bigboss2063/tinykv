@@ -294,6 +294,9 @@ func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 			if region.GetRegionEpoch() == nil {
 				return ErrRegionIsStale(region.GetMeta(), info.GetMeta())
 			}
+			if info.GetRegionEpoch() == nil {
+				continue
+			}
 			if util.IsEpochStale(region.GetRegionEpoch(), info.GetRegionEpoch()) {
 				return ErrRegionIsStale(region.GetMeta(), info.GetMeta())
 			}
