@@ -99,6 +99,7 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	// Your Code Here (4A).
 	write := &Write{}
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
 	for iter.Seek(key); iter.Valid(); iter.Next() {
 		k := iter.Item().KeyCopy(nil)
 		decodedUserKey := DecodeUserKey(k)
@@ -118,7 +119,7 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 			break
 		}
 	}
-	if write == nil {
+	if write == nil || write.Kind == WriteKindDelete || write.Kind == WriteKindRollback {
 		return nil, nil
 	}
 	encodedKey := EncodeKey(key, write.StartTS)
@@ -159,6 +160,7 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
 	for iter.Seek(key); iter.Valid(); iter.Next() {
 		key := iter.Item().KeyCopy(nil)
 		ts := decodeTimestamp(key)
@@ -190,6 +192,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 	// Your Code Here (4A).
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
+	defer iter.Close()
 	for iter.Seek(key); iter.Valid(); iter.Next() {
 		k := iter.Item().KeyCopy(nil)
 		decodedUserKey := DecodeUserKey(k)
