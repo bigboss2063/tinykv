@@ -145,7 +145,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 		if err != nil {
 			return nil, err
 		}
-		write, ts, err := txn.CurrentWrite(key)
+		write, _, err := txn.CurrentWrite(key)
 		if err != nil {
 			return nil, err
 		}
@@ -158,14 +158,8 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 		if lock == nil {
 			if write != nil && write.Kind == mvcc.WriteKindRollback {
 				resp.Error = &kvrpcpb.KeyError{
-					Abort: fmt.Sprintf("the transaction already committed or abort!"),
+					Abort: fmt.Sprintf("the transaction already roll back!"),
 				}
-			}
-			return resp, nil
-		}
-		if write != nil && ts >= req.CommitVersion {
-			resp.Error = &kvrpcpb.KeyError{
-				Conflict: &kvrpcpb.WriteConflict{Key: key, StartTs: write.StartTS, ConflictTs: ts, Primary: lock.Primary},
 			}
 			return resp, nil
 		}
@@ -250,7 +244,7 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 			resp.Action = kvrpcpb.Action_LockNotExistRollback
 			txn.PutWrite(req.PrimaryKey, txn.StartTS, &mvcc.Write{StartTS: txn.StartTS, Kind: mvcc.WriteKindRollback})
 		} else if write.Kind == mvcc.WriteKindRollback {
-			resp.Action = kvrpcpb.Action_LockNotExistRollback
+			resp.Action = kvrpcpb.Action_NoAction
 		} else {
 			resp.Action = kvrpcpb.Action_NoAction
 			resp.CommitVersion = txn.StartTS
@@ -278,23 +272,19 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 		if err != nil {
 			return nil, err
 		}
-		if lock != nil {
-			if lock.Ts < txn.StartTS {
-				txn.PutWrite(key, txn.StartTS, &mvcc.Write{StartTS: txn.StartTS, Kind: mvcc.WriteKindRollback})
-			} else {
-				txn.DeleteLock(key)
-				txn.DeleteValue(key)
-				txn.PutWrite(key, txn.StartTS, &mvcc.Write{StartTS: txn.StartTS, Kind: mvcc.WriteKindRollback})
-			}
+		write, _, err := txn.CurrentWrite(key)
+		if err != nil {
+			return nil, err
 		}
-		if lock == nil {
-			write, _, err := txn.CurrentWrite(key)
-			if err != nil {
-				return nil, err
-			}
+		if lock != nil && lock.Ts == txn.StartTS {
+			txn.DeleteLock(key)
+			txn.DeleteValue(key)
+			txn.PutWrite(key, txn.StartTS, &mvcc.Write{StartTS: txn.StartTS, Kind: mvcc.WriteKindRollback})
+		} else if (lock != nil && lock.Ts != txn.StartTS) || lock == nil {
 			if write != nil {
 				if write.Kind == mvcc.WriteKindRollback {
-					return resp, nil
+					// 如果已经回滚了就跳过这个 key
+					continue
 				} else {
 					resp.Error = &kvrpcpb.KeyError{Abort: "abort"}
 					return resp, nil
